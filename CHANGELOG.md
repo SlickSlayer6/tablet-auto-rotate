@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Rewrite the README as an end-user installation, configuration, operation, and
+  troubleshooting guide.
+- Update the roadmap to distinguish completed 0.3.0 foundations from upcoming
+  hardware-support, compatibility, integration, and distribution work.
+
 ## 0.3.0
 
 - Add deterministic, versioned JSON output for `--probe` and `--doctor`.

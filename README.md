@@ -1,123 +1,154 @@
 # Tablet Auto Rotate
 
-Safe automatic tablet-mode display and touchscreen rotation for Linux
-convertibles running Hyprland. The first physically verified profile targets
-an Acer TravelMate B311R-33 with Omarchy and Hyprland's Lua provider.
+Automatic display and touchscreen rotation for Linux convertible computers
+running Hyprland. Tablet Auto Rotate reads the laptop's tablet-mode switch and
+display accelerometer directly through Linux evdev and IIO, then keeps the
+configured internal display and touchscreen aligned.
 
-This is an early, configurable release built from a working hardware-calibrated
-prototype. It directly reads the Linux tablet-mode switch and display
-accelerometer without additional runtime Python packages.
-
-See [`ROADMAP.md`](ROADMAP.md) for the plan to turn this into universal tablet support for Hyprland with optional Omarchy integration.
+Omarchy is supported through an optional integration that refreshes shell
+surfaces after a rotation. The rotation daemon itself can run without Omarchy
+and has no third-party Python runtime dependencies.
 
 ## Features
 
 - Rotates only while the hardware tablet-mode switch is active
-- Restores normal landscape when returning to laptop mode
-- Rotates `eDP-1` and the ELAN touchscreen together
-- Rejects flat, diagonal, and moving sensor readings
-- Rediscovers input/IIO devices after suspend or driver reload
-- Uses a fast Omarchy layer-surface remap after rotation
-- Falls back to restarting the Omarchy shell if the fast remap cannot be verified
-- Does not enable/disable displays or change their mode, scale, or resolution
-- Loads machine identifiers, sensor axes, and transform mappings from TOML
-- Can run without the Omarchy-specific layer refresh adapter
+- Restores the configured landscape transform in laptop mode
+- Keeps the configured display and touchscreen transforms synchronized
+- Rejects flat, diagonal, moving, and unstable sensor readings
+- Rediscovers input and sensor devices after suspend or driver reload
+- Handles startup when the computer is already folded
+- Refuses ambiguous switch or accelerometer discovery instead of guessing
+- Never changes display mode, resolution, scale, or enabled state
+- Supports per-machine TOML configuration and read-only calibration
+- Provides human-readable and sanitized JSON diagnostics
+- Includes guarded systemd user-service installation
 
-## Tested environment
+## Requirements
 
-- Acer TravelMate B311R-33 / TravelMate B3 Spin 11
-- Omarchy 4.0.1
-- Hyprland 0.56.2 with the Lua config provider
-- Internal display: `eDP-1`
-- Touchscreen: `elan9004:00-04f3:4110`
-- Tablet switch: `Intel HID switches`, `SW_TABLET_MODE`
-- Display accelerometer identified by the HID hub shared with the hinge sensor
+- Linux with a tablet-mode switch that advertises `SW_TABLET_MODE`
+- A readable IIO `accel_3d` display sensor
+- Hyprland
+- Python 3.11 or newer
+- `hyprctl` available in the graphical session
+- Omarchy only when `desktop_integration = "omarchy"` is configured
 
-The bundled Acer values are defaults for compatibility and are also recorded in
-[`profiles/acer-travelmate-b311r-33.toml`](profiles/acer-travelmate-b311r-33.toml).
-Other machines should use an explicit configuration; see
-[`docs/configuration.md`](docs/configuration.md).
+Hardware layouts vary. The currently verified configuration is an Acer
+TravelMate B311R-33 / TravelMate B3 Spin 11 running Hyprland 0.56.2 and Omarchy
+4.0.1. See [hardware compatibility](docs/compatibility.md) for the exact test
+record and evidence levels.
 
-## Diagnostics
+## Install
 
-These commands do not rotate the display:
+From a source checkout:
 
-```bash
-bin/tablet-auto-rotate --self-test
-bin/tablet-auto-rotate --doctor
-bin/tablet-auto-rotate --doctor --json
-bin/tablet-auto-rotate --probe
-bin/tablet-auto-rotate --probe --json
-bin/tablet-auto-rotate --dry-run --verbose
-```
-
-`--dry-run` remains active until interrupted and listens to the real tablet switch and accelerometer.
-The JSON diagnostics use a stable, versioned, sanitized schema intended for
-community hardware reports and fixtures. See
-[`docs/diagnostics.md`](docs/diagnostics.md) before sharing a report.
-
-For a new machine, use capability-based switch discovery by setting both
-switch fields to `"auto"`, run `--probe`, and then use the read-only
-`--calibrate` flow. See [`docs/configuration.md`](docs/configuration.md) and
-[`docs/calibration.md`](docs/calibration.md).
-
-## Manual installation
-
-Install the package from a source checkout:
-
-```bash
+```console
 python3 -m pip install --user .
+tablet-auto-rotate --version
 ```
 
-For development, `bin/tablet-auto-rotate` remains a source-tree launcher.
+If your distribution prevents user-level `pip` installs, install the release
+wheel in a virtual environment or with your preferred isolated Python package
+manager.
 
-Merge the small rules in `examples/hypr/` into the corresponding files under `~/.config/hypr/`. Do not overwrite an existing Hyprland configuration wholesale.
+The Acer TravelMate profile is used when no configuration file exists. Other
+computers should create
+`~/.config/tablet-auto-rotate/config.toml` before starting the daemon. Begin by
+copying the example profile and replacing only values confirmed on your machine:
 
-Then validate:
-
-```bash
-hyprctl reload
-hyprctl configerrors
+```console
+mkdir -p ~/.config/tablet-auto-rotate
+cp profiles/acer-travelmate-b311r-33.toml ~/.config/tablet-auto-rotate/config.toml
+tablet-auto-rotate --doctor
+tablet-auto-rotate --probe
 ```
 
-The autostart rule takes effect on the next Hyprland session. For an immediate temporary launch under the current user manager:
+For unknown tablet switches, set `switch_name` and `preferred_switch_path` to
+`"auto"`. Discovery succeeds only when a unique capable switch is available.
+Use the read-only calibration command to determine sensor axes and transforms:
 
-```bash
+```console
+tablet-auto-rotate --calibrate
+```
+
+Review the proposed configuration and test touchscreen corners in every
+orientation before enabling automatic startup. See
+[configuration](docs/configuration.md) and [calibration](docs/calibration.md)
+for the complete procedure.
+
+## Run
+
+Test the daemon without changing display or input transforms:
+
+```console
+tablet-auto-rotate --dry-run --verbose
+```
+
+Press `Ctrl+C` to stop it. Once discovery, folding, and orientation changes look
+correct, run it normally:
+
+```console
+tablet-auto-rotate
+```
+
+For an immediate temporary launch under the systemd user manager:
+
+```console
 systemd-run --user --unit=tablet-auto-rotate-now --collect tablet-auto-rotate
 ```
 
-A guarded systemd user-service installer is also available for non-Omarchy
-sessions; see [`docs/service.md`](docs/service.md). It never invokes `systemctl`
-or overwrites a differing unit implicitly.
+For persistent startup outside Omarchy, use the guarded
+[systemd user-service installer](docs/service.md). Omarchy users can add the
+small UWSM-aware rule in `examples/hypr/autostart.lua`. The examples in
+`examples/hypr/` must be merged into existing Hyprland files; do not overwrite
+an existing configuration wholesale.
+
+## Diagnostics
+
+These commands are read-only and do not rotate the display:
+
+```console
+tablet-auto-rotate --self-test
+tablet-auto-rotate --doctor
+tablet-auto-rotate --probe
+tablet-auto-rotate --doctor --json
+tablet-auto-rotate --probe --json
+```
+
+JSON reports use a deterministic, versioned schema and redact common user-path
+and device-instance identifiers. Always review the complete report before
+sharing it. See [structured diagnostics](docs/diagnostics.md).
 
 ## How it works
 
-1. Reads the initial and subsequent `SW_TABLET_MODE` state through evdev.
-2. Finds the display accelerometer by matching it to the HID sensor hub that owns the hinge sensor.
-3. Filters raw IIO acceleration into one of four calibrated orientations.
-4. Applies matching Hyprland output and touch transforms through `hyprctl eval`.
-5. Forces Hyprland to commit the runtime monitor rule.
-6. Nudges and restores the monitor origin by one pixel, triggering Omarchy's existing layer-surface remap guard. With multiple active monitors, it skips the nudge and uses the safer full shell-restart fallback.
+1. Reads the initial and subsequent tablet-mode state through evdev.
+2. Selects the display accelerometer from its IIO topology.
+3. Filters acceleration into one of four calibrated orientations.
+4. Applies matching Hyprland display and touchscreen transforms.
+5. Verifies the display transform before reporting success.
+6. When using Omarchy, refreshes layer surfaces and falls back to a guarded
+   shell restart if the fast remap cannot be verified.
 
-## Current limitations
+When multiple monitors are active, the Omarchy integration skips the temporary
+one-pixel position nudge and uses the safer shell-restart path. External displays
+are not rotated, enabled, disabled, or repositioned.
 
-- Automatic discovery remains deliberately conservative and refuses ambiguous
-  tablet switches or accelerometers.
-- The fast shell remap depends on Omarchy's current `ScreenMoveRemap.qml` behavior.
-- Effective touchscreen transform cannot be queried from Hyprland, so corner-touch testing is still required after changing hardware mappings.
-- It has only been physically tested on the machine listed above.
+## Limitations
 
-Community testing is the intended path to broader support. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and
-[`docs/compatibility.md`](docs/compatibility.md) for sanitized hardware reports,
-evidence levels, and the physical test checklist.
+- Only transforms 0 through 3 are supported.
+- Automatic sensor selection does not yet use IIO mount matrices.
+- Machines with ambiguous or unusual multi-accelerometer topologies may require
+  further discovery support.
+- Effective touchscreen transform cannot be queried from Hyprland, so physical
+  corner-touch testing remains required after calibration.
+- The fast Omarchy surface refresh depends on current Omarchy behavior; a full
+  shell restart is used when it cannot be verified.
+- Physical verification currently covers only the Acer model listed above.
 
-## Before broader release
+Hardware reports from other convertible computers are welcome, including
+partial failures. See [contributing](CONTRIBUTING.md),
+[hardware compatibility](docs/compatibility.md), and the
+[project roadmap](ROADMAP.md).
 
-The next useful steps are:
+## License
 
-1. Add capability-based discovery with sanitized sysfs fixtures.
-2. Add an interactive calibration command and corner-touch validation.
-3. Collect community reports from other convertible sensor topologies.
-4. Support additional Hyprland configuration providers.
-5. Add an installer/uninstaller that safely merges—not replaces—user configuration.
+Tablet Auto Rotate is licensed under the [MIT License](LICENSE).

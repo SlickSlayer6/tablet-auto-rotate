@@ -2,8 +2,8 @@
 
 `tablet-auto-rotate` reads `$XDG_CONFIG_HOME/tablet-auto-rotate/config.toml`,
 or `~/.config/tablet-auto-rotate/config.toml` when `XDG_CONFIG_HOME` is unset.
-Use `--config PATH` to test a different file. When no file exists, version 0.1
-retains the original Acer TravelMate defaults for compatibility.
+Use `--config PATH` to test a different file. When no file exists, the bundled
+Acer TravelMate values are used for backward compatibility.
 
 Start from the physically verified profile in
 `profiles/acer-travelmate-b311r-33.toml` and change only values confirmed by
