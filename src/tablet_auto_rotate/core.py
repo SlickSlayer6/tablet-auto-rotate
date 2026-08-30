@@ -38,6 +38,7 @@ from .config import HardwareConfig, default_config_path, load_config
 from .discovery import (
     SwitchCandidate as DiscoverySwitchCandidate,
     SwitchSelection,
+    sanitize_report_name,
     sanitize_report_path,
     select_tablet_switch,
 )
@@ -46,6 +47,8 @@ from .calibration import CalibrationError, generate_config_toml, infer_axis_mapp
 
 
 SCRIPT_NAME = "tablet-auto-rotate"
+REPORT_SCHEMA_VERSION = 1
+SOURCE_VERSION = "0.3.0+source"
 
 # Device names and paths for this machine.
 PREFERRED_SWITCH_PATH = "/dev/input/by-path/platform-INTC1070:00-event"
@@ -1717,10 +1720,68 @@ def _format_values(values: Iterable[Any]) -> str:
     return " ".join(str(value) for value in values)
 
 
-def run_probe(verbose: bool = False) -> int:
-    """Print discovery and current read-only state without running rotation."""
+def application_version() -> str:
+    """Return the installed release, or an explicit source-tree fallback."""
+
+    try:
+        return version("tablet-auto-rotate")
+    except PackageNotFoundError:
+        return SOURCE_VERSION
+
+
+def _configuration_report(
+    config: HardwareConfig, config_path: Optional[str]
+) -> dict[str, Any]:
+    source = sanitize_report_path(config_path) if config_path else "defaults"
+    return {
+        "axis_order": list(config.axis_order),
+        "axis_signs": list(config.axis_signs),
+        "desktop_integration": sanitize_report_name(config.desktop_integration),
+        "orientation_transforms": list(config.orientation_transforms),
+        "output": sanitize_report_name(config.output),
+        "preferred_switch_path": sanitize_report_path(config.preferred_switch_path),
+        "source": source,
+        "switch_name": sanitize_report_name(config.switch_name),
+        "touch_device": sanitize_report_name(config.touch_device),
+    }
+
+
+def _report_envelope(
+    report_type: str, config: HardwareConfig, config_path: Optional[str]
+) -> dict[str, Any]:
+    return {
+        "application": {"name": SCRIPT_NAME, "version": application_version()},
+        "configuration": _configuration_report(config, config_path),
+        "report_type": report_type,
+        "schema_version": REPORT_SCHEMA_VERSION,
+    }
+
+
+def _sanitize_error(exc: BaseException) -> str:
+    return sanitize_report_name(str(exc), limit=240)
+
+
+def _sanitize_hid_hub(hid_hub: str) -> str:
+    clean = sanitize_report_name(hid_hub)
+    return re.sub(r"\.[0-9A-Fa-f]+$", ".<instance>", clean)
+
+
+def _write_json_report(report: dict[str, Any]) -> None:
+    json.dump(report, sys.stdout, indent=2, sort_keys=True)
+    print()
+
+
+def collect_probe_report(
+    config: HardwareConfig,
+    config_path: Optional[str],
+    *,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Collect a sanitized, versioned hardware report without writing stdout."""
 
     logger = Logger(verbose)
+    report = _report_envelope("probe", config, config_path)
+    errors: list[dict[str, str]] = []
     try:
         selection, switch_devices = discover_switch_selection()
         candidates = (
@@ -1732,39 +1793,54 @@ def run_probe(verbose: bool = False) -> int:
     except Exception as exc:
         selection = None
         candidates = []
+        errors.append({"component": "switch_discovery", "message": _sanitize_error(exc)})
         logger.error("probe-switch-discovery", f"switch discovery failed: {exc}", interval=0.0)
+    selection_report: dict[str, Any]
     if selection is not None:
-        print(f"switch_selection: {selection.status}: {selection.summary}")
-        for candidate in selection.candidates:
-            if not verbose and not candidate.capable and candidate.rank == 0:
-                continue
-            print(
-                "switch_candidate: "
-                f"{candidate.path} name={candidate.name!r} capable={candidate.capable} "
-                f"rank={candidate.rank} reasons={'; '.join(candidate.reasons)}"
-            )
-    switch_ok = False
-    if candidates:
-        print("switch_candidates: " + ", ".join(device.path for device in candidates))
+        relevant_candidates = [
+            candidate
+            for candidate in selection.candidates
+            if verbose or candidate.capable or candidate.rank != 0
+        ]
+        selection_report = {
+            "assessed_candidate_count": len(selection.candidates),
+            "candidates": [
+                {
+                    "capable": candidate.capable,
+                    "name": candidate.name,
+                    "path": candidate.path,
+                    "rank": candidate.rank,
+                    "reasons": list(candidate.reasons),
+                }
+                for candidate in relevant_candidates
+            ],
+            "status": selection.status,
+            "summary": sanitize_report_name(selection.summary),
+        }
     else:
-        print("switch_candidates: unavailable")
-
-    selected_switch: Optional[SwitchDevice] = None
+        selection_report = {
+            "assessed_candidate_count": 0,
+            "candidates": [],
+            "status": "error",
+            "summary": "switch discovery failed",
+        }
+    switch_ok = False
+    selected_switch_report: Optional[dict[str, Any]] = None
     fd: Optional[int] = None
     for candidate in candidates:
         try:
             fd, state = open_switch_device(candidate)
-            selected_switch = candidate
             switch_ok = True
-            print(f"switch_path: {candidate.path}")
-            print(f"switch_sysfs: {candidate.name_path}")
-            print(f"switch_name: {_read_text(candidate.name_path)}")
-            print(f"switch_state: {'tablet' if state else 'laptop'}")
+            selected_switch_report = {
+                "name": sanitize_report_name(_read_text(candidate.name_path)),
+                "path": sanitize_report_path(candidate.path),
+                "state": "tablet" if state else "laptop",
+                "sysfs_name_path": sanitize_report_path(candidate.name_path),
+            }
             break
         except Exception as exc:
+            errors.append({"component": "switch_read", "message": _sanitize_error(exc)})
             logger.error("probe-switch", f"cannot read {candidate.path}: {exc}", interval=0.0)
-    if selected_switch is None:
-        print("switch_state: unavailable")
     if fd is not None:
         try:
             os.close(fd)
@@ -1776,27 +1852,102 @@ def run_probe(verbose: bool = False) -> int:
         sensor = discover_accel()
     except Exception as exc:
         sensor = None
+        errors.append({"component": "sensor_discovery", "message": _sanitize_error(exc)})
         logger.error("probe-sensor", f"sensor discovery failed: {exc}", interval=0.0)
+    sensor_report: Optional[dict[str, Any]] = None
+    reading_report: Optional[dict[str, Any]] = None
     if sensor is None:
-        print("sensor_iio: unavailable")
+        if not any(error["component"] == "sensor_discovery" for error in errors):
+            errors.append({"component": "sensor_discovery", "message": "no unique readable accel_3d"})
     else:
-        print(f"sensor_hinge_iio: {sanitize_report_path(sensor.hinge_path) if sensor.hinge_path else 'none'}")
-        print(f"sensor_iio: {sanitize_report_path(sensor.iio_path)}")
-        print(f"sensor_hid_hub: {sensor.hid_hub}")
-        print(f"sensor_raw_paths: {_format_values(sensor.raw_paths)}")
-        print(f"sensor_scale_paths: {_format_values(sensor.scale_paths)}")
+        sensor_report = {
+            "hid_hub": _sanitize_hid_hub(sensor.hid_hub),
+            "hinge_path": sanitize_report_path(sensor.hinge_path) if sensor.hinge_path else None,
+            "iio_path": sanitize_report_path(sensor.iio_path),
+            "raw_paths": [sanitize_report_path(path) for path in sensor.raw_paths],
+            "scale_paths": [sanitize_report_path(path) for path in sensor.scale_paths],
+        }
         try:
             reading = read_accel(sensor)
         except Exception as exc:
+            errors.append({"component": "sensor_read", "message": _sanitize_error(exc)})
             logger.error("probe-sensor-read", f"cannot read sensor: {exc}", interval=0.0)
-            print("sensor_raw: unavailable")
         else:
             sensor_ok = True
-            print(f"sensor_raw: {_format_values(reading.raw)}")
-            print(f"sensor_scale: {_format_values(reading.scale)}")
-            print(f"sensor_world: {_format_values(f'{value:.6g}' for value in reading.values)}")
+            reading_report = {
+                "raw": list(reading.raw),
+                "scale": list(reading.scale),
+                "world": list(reading.values),
+            }
 
-    return 0 if switch_ok and sensor_ok else 1
+    report.update({
+        "errors": errors,
+        "ok": switch_ok and sensor_ok,
+        "sensor": {"reading": reading_report, "selected": sensor_report},
+        "switch": {"selected": selected_switch_report, "selection": selection_report},
+    })
+    return report
+
+
+def _render_probe_human(report: dict[str, Any], *, verbose: bool) -> None:
+    switch = report["switch"]
+    selection = switch["selection"]
+    print(f"switch_selection: {selection['status']}: {selection['summary']}")
+    for candidate in selection["candidates"]:
+        if not verbose and not candidate["capable"] and candidate["rank"] == 0:
+            continue
+        print(
+            "switch_candidate: "
+            f"{candidate['path']} name={candidate['name']!r} capable={candidate['capable']} "
+            f"rank={candidate['rank']} reasons={'; '.join(candidate['reasons'])}"
+        )
+    selected_switch = switch["selected"]
+    print(
+        "switch_candidates: "
+        + (selected_switch["path"] if selected_switch is not None else "unavailable")
+    )
+    if selected_switch is None:
+        print("switch_state: unavailable")
+    else:
+        print(f"switch_path: {selected_switch['path']}")
+        print(f"switch_sysfs: {selected_switch['sysfs_name_path']}")
+        print(f"switch_name: {selected_switch['name']}")
+        print(f"switch_state: {selected_switch['state']}")
+    sensor = report["sensor"]
+    selected_sensor = sensor["selected"]
+    if selected_sensor is None:
+        print("sensor_iio: unavailable")
+        return
+    print(f"sensor_hinge_iio: {selected_sensor['hinge_path'] or 'none'}")
+    print(f"sensor_iio: {selected_sensor['iio_path']}")
+    print(f"sensor_hid_hub: {selected_sensor['hid_hub']}")
+    print(f"sensor_raw_paths: {_format_values(selected_sensor['raw_paths'])}")
+    print(f"sensor_scale_paths: {_format_values(selected_sensor['scale_paths'])}")
+    reading = sensor["reading"]
+    if reading is None:
+        print("sensor_raw: unavailable")
+        return
+    print(f"sensor_raw: {_format_values(reading['raw'])}")
+    print(f"sensor_scale: {_format_values(reading['scale'])}")
+    print(f"sensor_world: {_format_values(f'{value:.6g}' for value in reading['world'])}")
+
+
+def run_probe(
+    verbose: bool = False,
+    *,
+    config: Optional[HardwareConfig] = None,
+    config_path: Optional[str] = None,
+    json_output: bool = False,
+) -> int:
+    """Print discovery and current read-only state without running rotation."""
+
+    report = collect_probe_report(config or HardwareConfig(), config_path, verbose=verbose)
+    if json_output:
+        _write_json_report(report)
+    else:
+        _render_probe_human(report, verbose=verbose)
+
+    return 0 if report["ok"] else 1
 
 
 def _assert_self_test(condition: bool, message: str) -> None:
@@ -2203,60 +2354,73 @@ def run_self_test() -> int:
     return 0
 
 
-def run_doctor(config: HardwareConfig, config_path: Optional[str]) -> int:
-    """Run read-only compatibility checks and print actionable results."""
+def collect_doctor_report(
+    config: HardwareConfig, config_path: Optional[str]
+) -> dict[str, Any]:
+    """Collect read-only compatibility checks in a stable report schema."""
 
-    checks: list[Tuple[str, bool, str]] = []
+    checks: list[tuple[str, str, bool, str]] = []
     checks.append((
+        "input_abi",
         "input ABI",
         INPUT_EVENT_SIZE == 24,
         f"input_event size is {INPUT_EVENT_SIZE} bytes (24 required)",
     ))
+    hyprctl_found = shutil.which("hyprctl") is not None
     checks.append((
         "hyprctl",
-        shutil.which("hyprctl") is not None,
-        "found on PATH" if shutil.which("hyprctl") else "not found on PATH",
+        "hyprctl",
+        hyprctl_found,
+        "found on PATH" if hyprctl_found else "not found on PATH",
     ))
     if config.desktop_integration == "omarchy":
+        omarchy_found = shutil.which("omarchy") is not None
         checks.append((
+            "omarchy",
             "Omarchy",
-            shutil.which("omarchy") is not None,
-            "found on PATH" if shutil.which("omarchy") else "not found on PATH",
+            omarchy_found,
+            "found on PATH" if omarchy_found else "not found on PATH",
         ))
     checks.append((
         "configuration",
+        "configuration",
         True,
-        config_path or f"defaults (expected user path: {default_config_path()})",
+        sanitize_report_path(config_path)
+        if config_path
+        else f"defaults (expected user path: {sanitize_report_path(str(default_config_path()))})",
     ))
-    checks.append(("target output", bool(config.output), config.output))
-    checks.append(("touch device", bool(config.touch_device), config.touch_device))
-    checks.append(("tablet switch", bool(config.switch_name), config.switch_name))
+    checks.append(("target_output", "target output", bool(config.output), sanitize_report_name(config.output)))
+    checks.append(("touch_device", "touch device", bool(config.touch_device), sanitize_report_name(config.touch_device)))
+    checks.append(("tablet_switch", "tablet switch", bool(config.switch_name), sanitize_report_name(config.switch_name)))
 
     try:
         selection, _ = discover_switch_selection()
     except Exception as exc:
-        checks.append(("switch discovery", False, f"failed: {exc}"))
+        checks.append(("switch_discovery", "switch discovery", False, f"failed: {_sanitize_error(exc)}"))
     else:
         checks.append((
+            "switch_discovery",
             "switch discovery",
             selection.status == "selected",
-            f"{selection.status}: {selection.summary}",
+            sanitize_report_name(f"{selection.status}: {selection.summary}"),
         ))
     try:
         sensor = discover_accel()
     except Exception as exc:
-        checks.append(("accelerometer discovery", False, f"failed: {exc}"))
+        checks.append(("accelerometer_discovery", "accelerometer discovery", False, f"failed: {_sanitize_error(exc)}"))
     else:
         checks.append((
+            "accelerometer_discovery",
             "accelerometer discovery",
             sensor is not None,
             sanitize_report_path(sensor.iio_path) if sensor is not None else "no unique readable accel_3d",
         ))
 
-    if shutil.which("hyprctl") is not None:
+    if hyprctl_found:
         logger = Logger(False)
         monitor = query_monitor_status(logger, report_errors=False)
         checks.append((
+            "hyprland_output",
             "Hyprland output",
             monitor is not None and monitor.found and monitor.enabled,
             (
@@ -2267,14 +2431,45 @@ def run_doctor(config: HardwareConfig, config_path: Optional[str]) -> int:
         ))
         touch = query_touch_device(logger)
         checks.append((
+            "hyprland_touch_device",
             "Hyprland touch device",
             touch is True,
             f"{config.touch_device} {'found' if touch is True else 'not confirmed'}",
         ))
 
-    for name, passed, detail in checks:
-        print(f"{'ok' if passed else 'FAIL'}: {name}: {detail}")
-    return 0 if all(passed for _, passed, _ in checks) else 1
+    report = _report_envelope("doctor", config, config_path)
+    report_checks = [
+        {
+            "detail": sanitize_report_name(detail, limit=240),
+            "id": check_id,
+            "name": name,
+            "status": "ok" if passed else "fail",
+        }
+        for check_id, name, passed, detail in checks
+    ]
+    report.update({
+        "checks": report_checks,
+        "ok": all(check["status"] == "ok" for check in report_checks),
+    })
+    return report
+
+
+def run_doctor(
+    config: HardwareConfig,
+    config_path: Optional[str],
+    *,
+    json_output: bool = False,
+) -> int:
+    """Run read-only compatibility checks and print actionable results."""
+
+    report = collect_doctor_report(config, config_path)
+    if json_output:
+        _write_json_report(report)
+    else:
+        for check in report["checks"]:
+            status = "ok" if check["status"] == "ok" else "FAIL"
+            print(f"{status}: {check['name']}: {check['detail']}")
+    return 0 if report["ok"] else 1
 
 
 def run_service_lifecycle(args: argparse.Namespace, *, remove: bool) -> int:
@@ -2384,11 +2579,7 @@ def _install_signal_handlers(stop: threading.Event) -> None:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    try:
-        release = version("tablet-auto-rotate")
-    except PackageNotFoundError:
-        release = "0.2.1+source"
-    parser.add_argument("--version", action="version", version=f"%(prog)s {release}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {application_version()}")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--probe", action="store_true", help="print devices and current read-only state")
     modes.add_argument("--dry-run", action="store_true", help="run classification without hyprctl changes")
@@ -2407,11 +2598,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         metavar="PATH",
         help="load machine settings from a TOML file",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit a versioned JSON report with --probe or --doctor",
+    )
     parser.add_argument("--verbose", action="store_true", help="log diagnostic details")
     parser.add_argument("--service-dry-run", action="store_true", help="preview a service operation")
     parser.add_argument("--replace-service", action="store_true", help="back up and replace a differing user unit")
     parser.add_argument("--service-executable", metavar="PATH", help="absolute executable path for the user unit")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.json_output and not (args.probe or args.doctor):
+        parser.error("--json requires --probe or --doctor")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2434,9 +2634,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.calibrate:
         return run_interactive_calibration(config)
     if args.doctor:
-        return run_doctor(config, args.config)
+        return run_doctor(config, args.config, json_output=args.json_output)
     if args.probe:
-        return run_probe(args.verbose)
+        return run_probe(
+            args.verbose,
+            config=config,
+            config_path=args.config,
+            json_output=args.json_output,
+        )
 
     if INPUT_EVENT_SIZE != 24:
         print(

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Add deterministic, versioned JSON output for `--probe` and `--doctor`.
+- Sanitize configuration paths, device labels, error text, and HID instance
+  identifiers in shareable diagnostics.
+- Give compatibility checks stable IDs and statuses for tooling and issue
+  intake while preserving the existing human-readable commands.
+
 ## 0.2.1
 
 - Keep tablet-switch handling and the daemon event loop responsive when a

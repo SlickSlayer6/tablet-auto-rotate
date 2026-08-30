@@ -18,6 +18,16 @@ For a newly tested computer, use the **Hardware report** issue form. A maintaine
 can help turn its sanitized diagnostics into a fixture or profile. Reports of
 failures are just as valuable as successful reports.
 
+Generate the preferred attachment with:
+
+```console
+tablet-auto-rotate --probe --json > probe.json
+```
+
+The command applies built-in redaction, but you must still review the complete
+file before publishing it. The schema and privacy boundary are documented in
+[`docs/diagnostics.md`](docs/diagnostics.md).
+
 ## Development workflow
 
 1. Fork the repository and create a focused branch.

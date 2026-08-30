@@ -77,9 +77,9 @@ body:
   - type: textarea
     id: diagnostics
     attributes:
-      label: Sanitized probe output
-      description: Review every line and remove private or unrelated information before submitting.
-      render: shell
+      label: Sanitized JSON probe report
+      description: Run tablet-auto-rotate --probe --json, then review the complete report and remove private or unrelated information before submitting.
+      render: json
   - type: textarea
     id: notes
     attributes:

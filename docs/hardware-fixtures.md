@@ -18,6 +18,12 @@ complete udev databases, or unrelated input devices. Replace topology instance
 identifiers with `<instance>` when identity—not the literal value—is what the
 test needs.
 
+Start with `tablet-auto-rotate --probe --json`; its versioned report already
+contains sanitized switch-selection and sensor-topology records. Review it for
+privacy, then reduce it to the fixture fields above rather than committing a
+complete point-in-time probe. See [structured diagnostics](diagnostics.md) for
+the report contract and sanitization boundary.
+
 A new fixture must be accompanied by a test that consumes it and by a hardware
 report stating exactly which behavior was physically exercised. Fixture-tested
 support alone does not establish touch alignment or reliable suspend behavior.

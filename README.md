@@ -45,11 +45,16 @@ These commands do not rotate the display:
 ```bash
 bin/tablet-auto-rotate --self-test
 bin/tablet-auto-rotate --doctor
+bin/tablet-auto-rotate --doctor --json
 bin/tablet-auto-rotate --probe
+bin/tablet-auto-rotate --probe --json
 bin/tablet-auto-rotate --dry-run --verbose
 ```
 
 `--dry-run` remains active until interrupted and listens to the real tablet switch and accelerometer.
+The JSON diagnostics use a stable, versioned, sanitized schema intended for
+community hardware reports and fixtures. See
+[`docs/diagnostics.md`](docs/diagnostics.md) before sharing a report.
 
 For a new machine, use capability-based switch discovery by setting both
 switch fields to `"auto"`, run `--probe`, and then use the read-only
@@ -96,8 +101,8 @@ or overwrites a differing unit implicitly.
 
 ## Current limitations
 
-- Hardware selection is configurable but automatic capability-based discovery
-  and interactive calibration are not implemented yet.
+- Automatic discovery remains deliberately conservative and refuses ambiguous
+  tablet switches or accelerometers.
 - The fast shell remap depends on Omarchy's current `ScreenMoveRemap.qml` behavior.
 - Effective touchscreen transform cannot be queried from Hyprland, so corner-touch testing is still required after changing hardware mappings.
 - It has only been physically tested on the machine listed above.
