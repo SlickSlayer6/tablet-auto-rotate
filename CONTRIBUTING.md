@@ -71,9 +71,9 @@ someone else's sign-off without their permission.
 
 ## Security and privacy
 
-Avoid
-publishing sensitive diagnostics. If a report could expose a security issue or
-private information, contact the maintainers privately through the security
-contact listed by the repository host rather than opening a public issue.
+Avoid publishing sensitive diagnostics. If a report could expose a security
+issue or private information, contact the maintainers privately through the
+security contact listed by the repository host rather than opening a public
+issue.
 
 [dco]: https://developercertificate.org/
