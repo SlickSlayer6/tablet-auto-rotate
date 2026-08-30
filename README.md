@@ -39,16 +39,16 @@ record and evidence levels.
 
 ## Install
 
-From a source checkout:
+Install [pipx](https://pipx.pypa.io/) with your distribution's package manager,
+then install from a source checkout in an isolated environment:
 
 ```console
-python3 -m pip install --user .
+pipx install .
 tablet-auto-rotate --version
 ```
 
-If your distribution prevents user-level `pip` installs, install the release
-wheel in a virtual environment or with your preferred isolated Python package
-manager.
+You can also give `pipx install` a downloaded release wheel. This avoids
+modifying the distribution-managed Python environment.
 
 The Acer TravelMate profile is used when no configuration file exists. Other
 computers should create

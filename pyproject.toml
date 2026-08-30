@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tablet-auto-rotate"
-version = "0.4.0"
+version = "0.4.1"
 description = "Safe automatic display and touchscreen rotation for Linux tablets"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,12 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/SlickSlayer6/tablet-auto-rotate"
+Documentation = "https://github.com/SlickSlayer6/tablet-auto-rotate#readme"
+Issues = "https://github.com/SlickSlayer6/tablet-auto-rotate/issues"
+Source = "https://github.com/SlickSlayer6/tablet-auto-rotate"
 
 [project.optional-dependencies]
 dev = [

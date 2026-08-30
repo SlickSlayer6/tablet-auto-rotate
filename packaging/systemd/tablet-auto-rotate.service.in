@@ -1,6 +1,6 @@
 [Unit]
 Description=Automatic display and touchscreen rotation
-Documentation=https://github.com/tablet-auto-rotate/tablet-auto-rotate
+Documentation=https://github.com/SlickSlayer6/tablet-auto-rotate
 After=graphical-session.target
 PartOf=graphical-session.target
 

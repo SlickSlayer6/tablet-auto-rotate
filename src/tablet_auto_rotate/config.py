@@ -39,7 +39,7 @@ def _required_string(table: dict[str, Any], key: str, default: str) -> str:
 
 
 def load_config(path: Path | None = None, *, required: bool = False) -> HardwareConfig:
-    """Load a TOML configuration, falling back to the calibrated prototype."""
+    """Load a TOML configuration, falling back to bundled compatibility values."""
 
     config_path = path or default_config_path()
     if not config_path.exists():

@@ -2,6 +2,8 @@ include LICENSE
 include README.md
 include ROADMAP.md
 include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
 recursive-include examples *.lua
 recursive-include profiles *.toml
 recursive-include docs *

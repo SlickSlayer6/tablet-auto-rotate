@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - Add a bounded AI-assisted setup prompt covering safe installation, discovery,
   calibration, physical validation, persistent startup, and rollback reporting.
+- Correct repository links in package metadata and generated systemd units.
+- Recommend isolated installation and document the current local release checks.
+- Add private vulnerability-reporting instructions for public users.
 
 ## 0.4.0
 

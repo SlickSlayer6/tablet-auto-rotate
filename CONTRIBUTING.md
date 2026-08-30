@@ -33,12 +33,14 @@ file before publishing it. The schema and privacy boundary are documented in
 1. Fork the repository and create a focused branch.
 2. Make the smallest coherent change that solves the problem.
 3. Add or update automated tests when behavior changes.
-4. Run the checks documented in the repository before submitting the change.
-   While the original standalone prototype is still supported, run:
+4. Create an isolated development environment and run the local release checks:
 
    ```console
-   python3 bin/tablet-auto-rotate --self-test
-   python3 -m py_compile bin/tablet-auto-rotate
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -e '.[dev]'
+   .venv/bin/python -m pytest -q
+   .venv/bin/python -m compileall -q src tests
+   .venv/bin/tablet-auto-rotate --self-test
    ```
 
 5. Explain the user-visible behavior, safety implications, and testing in the
@@ -71,9 +73,8 @@ someone else's sign-off without their permission.
 
 ## Security and privacy
 
-Avoid publishing sensitive diagnostics. If a report could expose a security
-issue or private information, contact the maintainers privately through the
-security contact listed by the repository host rather than opening a public
-issue.
+Avoid publishing sensitive diagnostics. Report security vulnerabilities through
+GitHub's private vulnerability-reporting form as described in
+[`SECURITY.md`](SECURITY.md), not through a public issue.
 
 [dco]: https://developercertificate.org/

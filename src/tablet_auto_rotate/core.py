@@ -48,7 +48,7 @@ from .calibration import CalibrationError, generate_config_toml, infer_axis_mapp
 
 SCRIPT_NAME = "tablet-auto-rotate"
 REPORT_SCHEMA_VERSION = 1
-SOURCE_VERSION = "0.4.0+source"
+SOURCE_VERSION = "0.4.1+source"
 
 # Device names and paths for this machine.
 PREFERRED_SWITCH_PATH = "/dev/input/by-path/platform-INTC1070:00-event"
