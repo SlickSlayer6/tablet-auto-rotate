@@ -21,6 +21,7 @@ class HardwareConfig:
     axis_order: tuple[str, str, str] = ("x", "y", "z")
     axis_signs: tuple[int, int, int] = (1, 1, 1)
     orientation_transforms: tuple[int, int, int, int] = (1, 2, 3, 0)
+    mount_matrix: str = "ignore"
 
 
 def default_config_path() -> Path:
@@ -87,6 +88,15 @@ def load_config(path: Path | None = None, *, required: bool = False) -> Hardware
         raise ValueError(
             "sensor.orientation_transforms must contain four transforms from 0 through 3"
         )
+    mount_matrix = sensor.get("mount_matrix", defaults.mount_matrix)
+    if not isinstance(mount_matrix, str) or mount_matrix not in {
+        "ignore",
+        "auto",
+        "require",
+    }:
+        raise ValueError(
+            "sensor.mount_matrix must be 'ignore', 'auto', or 'require'"
+        )
     return HardwareConfig(
         output=_required_string(hardware, "output", defaults.output),
         touch_device=_required_string(
@@ -100,4 +110,5 @@ def load_config(path: Path | None = None, *, required: bool = False) -> Hardware
         axis_order=tuple(axis_order_value),  # type: ignore[arg-type]
         axis_signs=tuple(axis_signs_value),  # type: ignore[arg-type]
         orientation_transforms=tuple(transforms_value),  # type: ignore[arg-type]
+        mount_matrix=mount_matrix,
     )

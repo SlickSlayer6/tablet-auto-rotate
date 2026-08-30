@@ -57,6 +57,11 @@ def test_probe_json_is_versioned_structured_and_sanitized(monkeypatch, capsys):
     assert report["switch"]["selected"]["state"] == "tablet"
     assert report["switch"]["selection"]["assessed_candidate_count"] == 1
     assert report["sensor"]["selected"]["hid_hub"].endswith(".<instance>")
+    assert report["sensor"]["selected"]["mount_matrix"] == {
+        "error": None,
+        "path": None,
+        "value": None,
+    }
     assert report["sensor"]["reading"]["raw"] == [1, 2, 3]
     assert "alice" not in captured.out
     assert "Tablet\\nSwitch" not in captured.out

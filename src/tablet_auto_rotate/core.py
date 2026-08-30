@@ -48,7 +48,7 @@ from .calibration import CalibrationError, generate_config_toml, infer_axis_mapp
 
 SCRIPT_NAME = "tablet-auto-rotate"
 REPORT_SCHEMA_VERSION = 1
-SOURCE_VERSION = "0.3.0+source"
+SOURCE_VERSION = "0.4.0+source"
 
 # Device names and paths for this machine.
 PREFERRED_SWITCH_PATH = "/dev/input/by-path/platform-INTC1070:00-event"
@@ -62,6 +62,7 @@ DESKTOP_INTEGRATION = "omarchy"
 AXIS_ORDER = (0, 1, 2)
 AXIS_SIGNS = (1, 1, 1)
 ORIENTATION_TRANSFORMS = (1, 2, 3, 0)  # +X, +Y, -X, -Y
+MOUNT_MATRIX_MODE = "ignore"
 
 # Linux input ABI constants.  The 64-bit input_event layout is timeval
 # (long long, long long), u16, u16, s32: qqHHi, 24 bytes on this machine.
@@ -143,6 +144,9 @@ class AccelDevice:
     name_path: str
     raw_paths: Tuple[str, str, str]
     scale_paths: Tuple[str, str, str]
+    mount_matrix_path: str = ""
+    mount_matrix: Optional[Tuple[Tuple[float, float, float], ...]] = None
+    mount_matrix_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -405,6 +409,60 @@ def _iio_device_dirs() -> list[str]:
     )
 
 
+def parse_mount_matrix(text: str) -> Tuple[Tuple[float, float, float], ...]:
+    """Parse and validate the Linux IIO 3x3 unitary mount-matrix ABI."""
+
+    clean = text.strip().translate(str.maketrans({"[": " ", "]": " "}))
+    tokens = [token for token in re.split(r"[,;\s]+", clean) if token]
+    if len(tokens) != 9:
+        raise ValueError("mount matrix must contain exactly nine numbers")
+    try:
+        values = tuple(float(token) for token in tokens)
+    except ValueError as exc:
+        raise ValueError("mount matrix contains a non-numeric value") from exc
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("mount matrix contains a non-finite value")
+    matrix = tuple(
+        tuple(values[row * 3 + column] for column in range(3))
+        for row in range(3)
+    )
+    tolerance = 1e-3
+    for row, vector in enumerate(matrix):
+        if abs(sum(value * value for value in vector) - 1.0) > tolerance:
+            raise ValueError(f"mount matrix row {row + 1} is not unit length")
+    for first in range(3):
+        for second in range(first + 1, 3):
+            dot = sum(
+                matrix[first][column] * matrix[second][column]
+                for column in range(3)
+            )
+            if abs(dot) > tolerance:
+                raise ValueError("mount matrix rows are not orthogonal")
+    return matrix  # type: ignore[return-value]
+
+
+def apply_mount_matrix(
+    matrix: Sequence[Sequence[float]], values: Sequence[float]
+) -> Tuple[float, float, float]:
+    """Rotate one physical sensor sample into the main-hardware frame."""
+
+    if len(matrix) != 3 or any(len(row) != 3 for row in matrix) or len(values) != 3:
+        raise ValueError("mount matrix and sample must both have three axes")
+    transformed = tuple(
+        sum(matrix[row][column] * values[column] for column in range(3))
+        for row in range(3)
+    )
+    if not all(math.isfinite(value) for value in transformed):
+        raise ValueError("mount matrix produced a non-finite sample")
+    return transformed  # type: ignore[return-value]
+
+
+def _mounted_values(device: AccelDevice, values: Sequence[float]) -> Tuple[float, float, float]:
+    if MOUNT_MATRIX_MODE in {"auto", "require"} and device.mount_matrix is not None:
+        return apply_mount_matrix(device.mount_matrix, values)
+    return tuple(values)  # type: ignore[return-value]
+
+
 def _make_accel_device(
     iio_path: str, hinge_path: str, hid_hub: str
 ) -> Optional[AccelDevice]:
@@ -424,6 +482,21 @@ def _make_accel_device(
     if not all(os.path.isfile(path) and os.access(path, os.R_OK)
                for path in raw_paths + scale_paths):
         return None
+    mount_matrix_path = ""
+    mount_matrix: Optional[Tuple[Tuple[float, float, float], ...]] = None
+    mount_matrix_error = ""
+    for filename in ("in_accel_mount_matrix", "in_mount_matrix", "mount_matrix"):
+        candidate = os.path.join(iio_path, filename)
+        if not os.path.isfile(candidate) or not os.access(candidate, os.R_OK):
+            continue
+        mount_matrix_path = candidate
+        try:
+            mount_matrix = parse_mount_matrix(_read_text(candidate))
+        except (OSError, UnicodeError, ValueError) as exc:
+            mount_matrix_error = str(exc)
+        break
+    if MOUNT_MATRIX_MODE == "require" and mount_matrix is None:
+        return None
     return AccelDevice(
         iio_path=iio_path,
         hinge_path=hinge_path,
@@ -431,6 +504,9 @@ def _make_accel_device(
         name_path=name_path,
         raw_paths=raw_paths,  # type: ignore[arg-type]
         scale_paths=scale_paths,  # type: ignore[arg-type]
+        mount_matrix_path=mount_matrix_path,
+        mount_matrix=mount_matrix,
+        mount_matrix_error=mount_matrix_error,
     )
 
 
@@ -485,8 +561,9 @@ def read_accel(device: AccelDevice) -> AccelReading:
     scale = tuple(float(_read_text(path)) for path in device.scale_paths)
     if not all(math.isfinite(value) and value != 0.0 for value in scale):
         raise ValueError("invalid accelerometer scale")
-    values = tuple(raw_value * scale_value
-                   for raw_value, scale_value in zip(raw, scale))
+    physical_values = tuple(raw_value * scale_value
+                            for raw_value, scale_value in zip(raw, scale))
+    values = _mounted_values(device, physical_values)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("invalid accelerometer sample")
     return AccelReading(raw=raw, scale=scale, values=values)  # type: ignore[arg-type]
@@ -501,7 +578,15 @@ def read_orientation_accel(device: AccelDevice) -> AccelReading:
     Full three-axis reads remain available to probe and calibration commands.
     """
 
-    required = set(AXIS_ORDER[:2])
+    if MOUNT_MATRIX_MODE in {"auto", "require"} and device.mount_matrix is not None:
+        required = {
+            physical_axis
+            for mounted_axis in AXIS_ORDER[:2]
+            for physical_axis, coefficient in enumerate(device.mount_matrix[mounted_axis])
+            if abs(coefficient) > 1e-12
+        }
+    else:
+        required = set(AXIS_ORDER[:2])
     raw_values = [0, 0, 0]
     scale_values = [1.0, 1.0, 1.0]
     for index in required:
@@ -509,10 +594,11 @@ def read_orientation_accel(device: AccelDevice) -> AccelReading:
         scale_values[index] = float(_read_text(device.scale_paths[index]))
         if not math.isfinite(scale_values[index]) or scale_values[index] == 0.0:
             raise ValueError("invalid accelerometer scale")
-    values = tuple(
+    physical_values = tuple(
         raw_value * scale_value
         for raw_value, scale_value in zip(raw_values, scale_values)
     )
+    values = _mounted_values(device, physical_values)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("invalid accelerometer sample")
     return AccelReading(
@@ -1672,6 +1758,7 @@ def apply_config(config: HardwareConfig) -> None:
 
     global OUTPUT_NAME, TOUCH_DEVICE_NAME, SWITCH_NAME, PREFERRED_SWITCH_PATH
     global DESKTOP_INTEGRATION, AXIS_ORDER, AXIS_SIGNS, ORIENTATION_TRANSFORMS
+    global MOUNT_MATRIX_MODE
     OUTPUT_NAME = config.output
     TOUCH_DEVICE_NAME = config.touch_device
     SWITCH_NAME = config.switch_name
@@ -1681,6 +1768,7 @@ def apply_config(config: HardwareConfig) -> None:
     AXIS_ORDER = tuple(axis_indexes[axis] for axis in config.axis_order)
     AXIS_SIGNS = config.axis_signs
     ORIENTATION_TRANSFORMS = config.orientation_transforms
+    MOUNT_MATRIX_MODE = config.mount_matrix
 
 
 def acquire_lock(logger: Logger) -> Optional[int]:
@@ -1738,6 +1826,7 @@ def _configuration_report(
         "axis_signs": list(config.axis_signs),
         "desktop_integration": sanitize_report_name(config.desktop_integration),
         "orientation_transforms": list(config.orientation_transforms),
+        "mount_matrix": config.mount_matrix,
         "output": sanitize_report_name(config.output),
         "preferred_switch_path": sanitize_report_path(config.preferred_switch_path),
         "source": source,
@@ -1864,6 +1953,14 @@ def collect_probe_report(
             "hid_hub": _sanitize_hid_hub(sensor.hid_hub),
             "hinge_path": sanitize_report_path(sensor.hinge_path) if sensor.hinge_path else None,
             "iio_path": sanitize_report_path(sensor.iio_path),
+            "mount_matrix": {
+                "error": sanitize_report_name(sensor.mount_matrix_error, limit=240)
+                if sensor.mount_matrix_error else None,
+                "path": sanitize_report_path(sensor.mount_matrix_path)
+                if sensor.mount_matrix_path else None,
+                "value": [list(row) for row in sensor.mount_matrix]
+                if sensor.mount_matrix is not None else None,
+            },
             "raw_paths": [sanitize_report_path(path) for path in sensor.raw_paths],
             "scale_paths": [sanitize_report_path(path) for path in sensor.scale_paths],
         }
@@ -1921,6 +2018,14 @@ def _render_probe_human(report: dict[str, Any], *, verbose: bool) -> None:
     print(f"sensor_hinge_iio: {selected_sensor['hinge_path'] or 'none'}")
     print(f"sensor_iio: {selected_sensor['iio_path']}")
     print(f"sensor_hid_hub: {selected_sensor['hid_hub']}")
+    matrix = selected_sensor["mount_matrix"]
+    print(f"sensor_mount_matrix_path: {matrix['path'] or 'none'}")
+    print(
+        "sensor_mount_matrix: "
+        f"{matrix['value'] if matrix['value'] is not None else 'unavailable'}"
+    )
+    if matrix["error"] is not None:
+        print(f"sensor_mount_matrix_error: {matrix['error']}")
     print(f"sensor_raw_paths: {_format_values(selected_sensor['raw_paths'])}")
     print(f"sensor_scale_paths: {_format_values(selected_sensor['scale_paths'])}")
     reading = sensor["reading"]

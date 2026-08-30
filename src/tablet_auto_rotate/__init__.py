@@ -7,6 +7,6 @@ try:
 
     __version__ = version("tablet-auto-rotate")
 except PackageNotFoundError:
-    __version__ = "0.3.0+source"
+    __version__ = "0.4.0+source"
 
 __all__ = ["__version__", "main"]

@@ -37,6 +37,7 @@ desktop_integration = "none"
 axis_order = ["y", "x", "z"]
 axis_signs = [-1, 1, 1]
 orientation_transforms = [3, 0, 1, 2]
+mount_matrix = "auto"
 """,
     )
 
@@ -46,6 +47,7 @@ orientation_transforms = [3, 0, 1, 2]
     assert core.OUTPUT_NAME == "DSI-1"
     assert core.TOUCH_DEVICE_NAME == "example-touch"
     assert core.DESKTOP_INTEGRATION == "none"
+    assert core.MOUNT_MATRIX_MODE == "auto"
     assert core.map_sensor_values((10.0, 20.0, 30.0)) == (-20.0, 10.0, 30.0)
     assert core.classify_orientation((core.GRAVITY, 0.0, 0.0)) == 3
 
@@ -60,6 +62,7 @@ orientation_transforms = [3, 0, 1, 2]
             "orientation_transforms",
         ),
         ("[hardware]\ndesktop_integration = 'unknown'\n", "desktop_integration"),
+        ("[sensor]\nmount_matrix = 'sometimes'\n", "mount_matrix"),
     ],
 )
 def test_invalid_configuration_is_rejected(tmp_path, body, message):

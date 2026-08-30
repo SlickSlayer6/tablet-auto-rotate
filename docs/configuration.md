@@ -21,12 +21,28 @@ desktop_integration = "omarchy" # or "none"
 axis_order = ["x", "y", "z"]
 axis_signs = [1, 1, 1]
 orientation_transforms = [1, 2, 3, 0]
+mount_matrix = "ignore" # "auto" or "require" to apply an IIO mount matrix
 ```
 
 `axis_order` maps physical IIO axes to logical screen X, Y, and Z.
 `axis_signs` then flips the corresponding logical axes. The four orientation
 transforms correspond, in order, to gravity along logical `+X`, `+Y`, `-X`,
 and `-Y`.
+
+`mount_matrix` controls standard Linux IIO mount-matrix handling:
+
+- `"ignore"` preserves the configured axis behavior and is the default for
+  backward compatibility;
+- `"auto"` applies a valid matrix when the selected sensor exposes one and
+  otherwise uses the configured axes unchanged;
+- `"require"` applies a valid matrix and refuses sensors where it is missing or
+  invalid.
+
+The mount matrix is applied first, converting chip axes to the computer's main
+hardware frame. `axis_order` and `axis_signs` are then applied to that result.
+Existing calibrated profiles should remain on `"ignore"` unless they are
+retested with mount-matrix handling enabled. Use `--probe --json` to inspect the
+selected sensor's matrix before changing this setting.
 
 Only transforms 0 through 3 are currently supported. Invalid, incomplete, or
 ambiguous configuration is rejected before the daemon opens a device or

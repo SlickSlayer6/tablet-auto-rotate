@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
+- Add validated Linux IIO mount-matrix discovery and application with
+  backward-compatible `ignore`, optional `auto`, and strict `require` policies.
+- Include sanitized mount-matrix metadata in probe reports and hardware
+  fixtures while preserving selective physical-axis reads.
 - Rewrite the README as an end-user installation, configuration, operation, and
   troubleshooting guide.
 - Update the roadmap to distinguish completed 0.3.0 foundations from upcoming

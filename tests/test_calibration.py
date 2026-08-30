@@ -77,6 +77,7 @@ def test_generates_parseable_complete_config():
         preferred_switch_path="/dev/input/event0",
         desktop_integration="none",
         orientation_transforms=(3, 0, 1, 2),
+        mount_matrix="auto",
     )
     result = infer_axis_mapping(
         {
@@ -91,3 +92,4 @@ def test_generates_parseable_complete_config():
     assert parsed["sensor"]["axis_order"] == ["y", "x", "z"]
     assert parsed["sensor"]["axis_signs"] == [-1, 1, 1]
     assert parsed["sensor"]["orientation_transforms"] == [3, 0, 1, 2]
+    assert parsed["sensor"]["mount_matrix"] == "auto"

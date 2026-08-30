@@ -31,6 +31,12 @@ only by `assessed_candidate_count`; `--verbose` explicitly includes them. Object
 keys are sorted when serialized to make reports easy to compare. Array order is
 meaningful and remains discovery or axis order.
 
+The selected sensor record includes the discovered IIO mount-matrix path,
+validated numeric value, and any validation error. The effective configuration's
+`mount_matrix` field shows whether the daemon ignores, optionally applies, or
+requires that matrix. Sensor `world` values are expressed after matrix
+application when the configured policy enables it.
+
 Additive fields may appear without changing `schema_version`. A schema version
 change indicates an incompatible structural or semantic change. Consumers
 should ignore unknown fields and reject unsupported schema versions.

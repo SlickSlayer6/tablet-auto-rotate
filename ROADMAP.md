@@ -6,7 +6,7 @@ Hardware support is evidence-based: ambiguous discovery must fail safely, and a
 profile is considered physically verified only after its display, touch,
 suspend, and folded-startup behavior has been exercised on that machine.
 
-## Current state — 0.3.0
+## Current state — 0.4.0
 
 The following foundations are complete:
 
@@ -25,6 +25,7 @@ The following foundations are complete:
 - Optional Omarchy layer-surface refresh with guarded fallback behavior
 - Guarded systemd user-service installation and removal
 - Human-readable diagnostics plus sanitized, versioned JSON reports
+- Validated, opt-in IIO mount-matrix application with a strict required mode
 - Fixture-driven discovery tests, community report templates, and compatibility
   evidence levels
 - Maintainer verification on the Acer TravelMate B311R-33 across all four
@@ -38,7 +39,7 @@ the release gate.
 
 The immediate priority is making community reports straightforward to consume:
 
-1. Collect sanitized 0.3.0 probe reports from additional convertible computers.
+1. Collect sanitized 0.4.0 probe reports from additional convertible computers.
 2. Convert reviewed reports into minimal regression fixtures and, where the
    evidence supports them, reusable profiles.
 3. Record successes and failures in the compatibility matrix without claiming
@@ -53,7 +54,8 @@ to provide machines to the maintainer.
 
 ## Hardware discovery and calibration
 
-- Read standard IIO mount matrices when available.
+- Collect fixtures containing standard IIO mount matrices from hardware that
+  exposes them and physically verify the resulting hardware-frame orientation.
 - Support additional dual-accelerometer and base/display sensor layouts.
 - Distinguish machines where a hinge sensor is absent, hidden, or insufficient
   to identify the display sensor.

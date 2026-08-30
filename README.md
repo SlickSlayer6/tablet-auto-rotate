@@ -135,7 +135,8 @@ are not rotated, enabled, disabled, or repositioned.
 ## Limitations
 
 - Only transforms 0 through 3 are supported.
-- Automatic sensor selection does not yet use IIO mount matrices.
+- IIO mount matrices are supported conservatively but remain opt-in so existing
+  calibrated profiles do not change behavior during an upgrade.
 - Machines with ambiguous or unusual multi-accelerometer topologies may require
   further discovery support.
 - Effective touchscreen transform cannot be queried from Hyprland, so physical

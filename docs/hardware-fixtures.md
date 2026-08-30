@@ -10,7 +10,7 @@ JSON fixtures live under `tests/fixtures`, use `schema_version: 1`, and contain:
 - input switch candidates with a generic `/dev/input` path, kernel name, and
   advertised numeric switch codes;
 - IIO function names, redacted topology identifiers, and required attribute
-  availability;
+  availability, including a mount matrix when one is exposed;
 - the expected conservative selection result.
 
 Do not include hostnames, usernames, `/run/user` IDs, device serial numbers,

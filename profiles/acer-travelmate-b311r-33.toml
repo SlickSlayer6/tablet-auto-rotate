@@ -12,3 +12,4 @@ desktop_integration = "omarchy"
 axis_order = ["x", "y", "z"]
 axis_signs = [1, 1, 1]
 orientation_transforms = [1, 2, 3, 0]
+mount_matrix = "ignore"

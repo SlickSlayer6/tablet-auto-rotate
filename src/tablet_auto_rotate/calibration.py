@@ -153,6 +153,7 @@ def generate_config_toml(hardware: HardwareConfig, result: CalibrationResult) ->
         f"axis_order = [{order}]\n"
         f"axis_signs = [{signs}]\n"
         f"orientation_transforms = [{transforms}]\n"
+        f"mount_matrix = {quoted(calibrated.mount_matrix)}\n"
     )
     # Guard against accidental generation of malformed or structurally incomplete TOML.
     parsed = tomllib.loads(text)

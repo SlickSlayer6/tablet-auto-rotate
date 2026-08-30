@@ -103,3 +103,30 @@ def test_orientation_read_skips_unused_physical_z(monkeypatch):
 
     assert reading.values == (1.0, -2.0, 0.0)
     assert "z" not in reads and "sz" not in reads
+
+
+def test_orientation_read_applies_mount_matrix_and_reads_needed_axes(monkeypatch):
+    selected = core.AccelDevice(
+        iio_path="/sensor",
+        hinge_path="",
+        hid_hub="test",
+        name_path="name",
+        raw_paths=("x", "y", "z"),
+        scale_paths=("sx", "sy", "sz"),
+        mount_matrix=((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0)),
+    )
+    values = {"y": "-200", "z": "100", "sy": "0.01", "sz": "0.01"}
+    reads = []
+
+    def read_text(path):
+        reads.append(path)
+        return values[path]
+
+    monkeypatch.setattr(core, "MOUNT_MATRIX_MODE", "auto")
+    monkeypatch.setattr(core, "AXIS_ORDER", (0, 1, 2))
+    monkeypatch.setattr(core, "_read_text", read_text)
+
+    reading = core.read_orientation_accel(selected)
+
+    assert reading.values == (1.0, -2.0, 0.0)
+    assert "x" not in reads and "sx" not in reads

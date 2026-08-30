@@ -22,7 +22,8 @@
       "name": "accel_3d",
       "hid_hub": "001F:8087:0AC2.<instance>",
       "has_xyz_raw": true,
-      "has_scale": true
+      "has_scale": true,
+      "mount_matrix": null
     },
     {
       "name": "hinge",
