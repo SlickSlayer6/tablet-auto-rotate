@@ -21,11 +21,12 @@ report is not automatically maintainer-verified.
 
 | Machine | Software | Evidence | Verified behavior | Known limitation | Last tested |
 | --- | --- | --- | --- | --- | --- |
-| Acer TravelMate B311R-33 / TravelMate B3 Spin 11 | Linux 7.1.9-arch1-2; Hyprland 0.56.2 Lua provider; Omarchy 4.0.1-1; tablet-auto-rotate 0.2.0 | Maintainer-verified | Tablet/laptop switch; transforms 0, 1, 2, and 3; touchscreen corner alignment in every orientation; laptop-mode restoration | The one-pixel fast layer remap did not verify; the guarded Omarchy shell-restart fallback succeeded for every transform | 2026-08-30 |
+| Acer TravelMate B311R-33 / TravelMate B3 Spin 11 | Linux 7.1.9-arch1-2; Hyprland 0.56.2 Lua provider; Omarchy 4.0.1-1; tablet-auto-rotate 0.2.1 | Maintainer-verified | Tablet/laptop switch; transforms 0, 1, 2, and 3; touchscreen corner alignment in every orientation; laptop-mode restoration; suspend/resume; startup while already folded | The one-pixel fast layer remap did not verify; the guarded Omarchy shell-restart fallback succeeded for every transform | 2026-08-30 |
 
-The 0.2.0 validation was performed once in read-only dry-run mode and once with
-live compositor/input transforms. The original transient production daemon was
-restored after testing.
+The 0.2.0 orientation validation was performed once in read-only dry-run mode
+and once with live compositor/input transforms. Version 0.2.1 was then tested
+across suspend/resume and a right-edge-down folded startup. It applied transform
+1 promptly and restored transform 0 after unfolding.
 
 ## Recording a device
 

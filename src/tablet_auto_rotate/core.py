@@ -21,6 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import signal
 import shutil
@@ -116,6 +117,7 @@ STABILITY_DOT = 0.96
 STABILITY_MAGNITUDE_RATIO = 0.20
 CANDIDATE_HOLD_SECONDS = 0.35
 MAX_SAMPLE_GAP_SECONDS = 0.25
+SENSOR_READ_WARNING_SECONDS = 0.50
 
 
 @dataclass(frozen=True)
@@ -485,6 +487,36 @@ def read_accel(device: AccelDevice) -> AccelReading:
     if not all(math.isfinite(value) for value in values):
         raise ValueError("invalid accelerometer sample")
     return AccelReading(raw=raw, scale=scale, values=values)  # type: ignore[arg-type]
+
+
+def read_orientation_accel(device: AccelDevice) -> AccelReading:
+    """Read only physical axes mapped to logical screen X/Y.
+
+    Screen orientation does not need the logical Z component: a flat screen is
+    rejected because planar gravity is below ``MIN_ACCEL_MAGNITUDE``. Avoiding
+    the unused axis also avoids known HID sensor-driver stalls on some hardware.
+    Full three-axis reads remain available to probe and calibration commands.
+    """
+
+    required = set(AXIS_ORDER[:2])
+    raw_values = [0, 0, 0]
+    scale_values = [1.0, 1.0, 1.0]
+    for index in required:
+        raw_values[index] = int(_read_text(device.raw_paths[index]), 10)
+        scale_values[index] = float(_read_text(device.scale_paths[index]))
+        if not math.isfinite(scale_values[index]) or scale_values[index] == 0.0:
+            raise ValueError("invalid accelerometer scale")
+    values = tuple(
+        raw_value * scale_value
+        for raw_value, scale_value in zip(raw_values, scale_values)
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("invalid accelerometer sample")
+    return AccelReading(
+        raw=tuple(raw_values),  # type: ignore[arg-type]
+        scale=tuple(scale_values),  # type: ignore[arg-type]
+        values=values,  # type: ignore[arg-type]
+    )
 
 
 def _vector_magnitude(values: Sequence[float]) -> float:
@@ -1349,18 +1381,72 @@ class SwitchReader:
 
 
 class SensorReader:
-    """Read the selected IIO device and rediscover it after any read failure."""
+    """Read IIO asynchronously so a blocked kernel attribute cannot freeze policy."""
 
     def __init__(self, logger: Logger) -> None:
         self.logger = logger
         self.device: Optional[AccelDevice] = None
         self._next_discovery = 0.0
+        self._generation = 0
+        self._worker: Optional[threading.Thread] = None
+        self._worker_started = 0.0
+        self._results: queue.SimpleQueue[
+            tuple[int, Optional[AccelReading], Optional[BaseException]]
+        ] = queue.SimpleQueue()
 
     def reset(self) -> None:
+        self._generation += 1
         self.device = None
         self._next_discovery = 0.0
 
+    def _start_read(self, now: float) -> None:
+        if self.device is None or self._worker is not None:
+            return
+        device = self.device
+        generation = self._generation
+
+        def worker() -> None:
+            try:
+                reading = read_orientation_accel(device)
+            except BaseException as exc:
+                self._results.put((generation, None, exc))
+            else:
+                self._results.put((generation, reading, None))
+
+        self._worker_started = now
+        self._worker = threading.Thread(
+            target=worker,
+            name="tablet-auto-rotate-sensor-read",
+            daemon=True,
+        )
+        self._worker.start()
+
     def read(self, now: float) -> Optional[AccelReading]:
+        if self._worker is not None:
+            try:
+                generation, reading, error = self._results.get_nowait()
+            except queue.Empty:
+                if now - self._worker_started >= SENSOR_READ_WARNING_SECONDS:
+                    self.logger.error(
+                        "sensor-read-blocked",
+                        "accelerometer kernel read is blocked; switch handling remains active",
+                    )
+                return None
+            self._worker = None
+            if generation != self._generation:
+                return None
+            if error is not None:
+                self.logger.error(
+                    "sensor-read",
+                    f"accelerometer read failed: {error}; rediscovering",
+                )
+                self.reset()
+                self._next_discovery = now + DEVICE_RETRY_INTERVAL
+                return None
+            if reading is not None:
+                self._start_read(now)
+                return reading
+
         if self.device is None:
             if now < self._next_discovery:
                 return None
@@ -1380,14 +1466,8 @@ class SensorReader:
             self.logger.info(
                 f"accelerometer {device.iio_path} selected (hub {device.hid_hub})"
             )
-
-        try:
-            return read_accel(self.device)
-        except Exception as exc:
-            self.logger.error("sensor-read", f"accelerometer read failed: {exc}; rediscovering")
-            self.device = None
-            self._next_discovery = now + DEVICE_RETRY_INTERVAL
-            return None
+        self._start_read(now)
+        return None
 
 
 class RotationDaemon:
@@ -1526,7 +1606,6 @@ class RotationDaemon:
     def _sample_sensor(self, now: float) -> None:
         reading = self.sensor.read(now)
         if reading is None:
-            self.filter.reset()
             return
         transform = self.filter.update(map_sensor_values(reading.values), now)
         if transform is not None:
@@ -2308,7 +2387,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     try:
         release = version("tablet-auto-rotate")
     except PackageNotFoundError:
-        release = "0.2.0+source"
+        release = "0.2.1+source"
     parser.add_argument("--version", action="version", version=f"%(prog)s {release}")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--probe", action="store_true", help="print devices and current read-only state")

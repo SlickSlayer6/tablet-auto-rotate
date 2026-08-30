@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tablet-auto-rotate"
-version = "0.2.0"
+version = "0.2.1"
 description = "Safe automatic display and touchscreen rotation for Linux tablets"
 readme = "README.md"
 requires-python = ">=3.11"

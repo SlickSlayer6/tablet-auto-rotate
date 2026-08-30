@@ -80,3 +80,16 @@ def test_invalid_desired_transform_is_cleared():
 
     assert daemon.desired_transform is None
     assert logger.errors[0][0] == "transform"
+
+
+def test_pending_async_sensor_read_preserves_filter_candidate(monkeypatch):
+    logger = RecordingLogger()
+    daemon = core.RotationDaemon(logger)
+    daemon.filter.candidate = 1
+    daemon.filter.candidate_since = 10.0
+    monkeypatch.setattr(daemon.sensor, "read", lambda _now: None)
+
+    daemon._sample_sensor(10.1)
+
+    assert daemon.filter.candidate == 1
+    assert daemon.filter.candidate_since == 10.0
