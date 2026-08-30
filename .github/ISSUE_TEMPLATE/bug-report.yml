@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible problem not specific to a new hardware profile
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Before posting logs or probe output, remove usernames, hostnames, serial numbers, and unrelated device data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include what you expected and what occurred instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Environment
+      description: Include project version/commit, Linux distribution, kernel, Python, Hyprland, and desktop integration versions.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Remove secrets and identifying information.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Include the smallest section that shows the failure.
+      render: shell
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I reviewed this report and its attachments for private or unrelated information.
+          required: true

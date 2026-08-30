@@ -1,0 +1,14 @@
+# Physically verified on an Acer TravelMate B311R-33 / TravelMate B3 Spin 11.
+[hardware]
+output = "eDP-1"
+touch_device = "elan9004:00-04f3:4110"
+switch_name = "Intel HID switches"
+preferred_switch_path = "/dev/input/by-path/platform-INTC1070:00-event"
+desktop_integration = "omarchy"
+
+[sensor]
+# Logical X/Y/Z are selected from these physical IIO axes, then multiplied by
+# the corresponding signs. Transforms are ordered +X, +Y, -X, -Y.
+axis_order = ["x", "y", "z"]
+axis_signs = [1, 1, 1]
+orientation_transforms = [1, 2, 3, 0]

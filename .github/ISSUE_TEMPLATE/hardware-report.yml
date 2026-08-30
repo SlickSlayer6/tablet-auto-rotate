@@ -1,0 +1,96 @@
+name: Hardware report
+description: Report success or failure on a specific convertible computer
+title: "[Hardware]: "
+labels: [hardware-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping broaden hardware support. Remove usernames, hostnames,
+        serial numbers, and unrelated device data before attaching diagnostics.
+        It is useful to submit failures and partially working machines.
+  - type: input
+    id: manufacturer
+    attributes:
+      label: Manufacturer
+      placeholder: Acer
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Exact model and hardware revision
+      description: Use the marketing model plus revision/SKU, but omit serial numbers.
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Software and firmware versions
+      description: Include project version/commit, kernel, Hyprland, desktop integration, and BIOS/firmware where known.
+      placeholder: |
+        Project commit:
+        Kernel:
+        Hyprland:
+        Desktop/Omarchy:
+        BIOS/firmware:
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Overall outcome
+      options:
+        - Works completely
+        - Works partially
+        - Does not work
+        - Diagnostics only / not physically tested
+    validations:
+      required: true
+  - type: checkboxes
+    id: tested
+    attributes:
+      label: Features physically tested
+      description: Select only tests you personally performed; describe results below.
+      options:
+        - label: Laptop/tablet mode transitions
+        - label: All four display orientations
+        - label: Touchscreen alignment in all tested orientations
+        - label: Stylus alignment
+        - label: Suspend and resume
+        - label: External-display safety
+        - label: Device disconnect/reconnect behavior
+  - type: textarea
+    id: results
+    attributes:
+      label: Detailed results
+      description: For every relevant feature, state pass, fail, not tested, or not applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration or profile
+      description: Paste the relevant sanitized configuration. Markdown code fences are helpful.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized probe output
+      description: Review every line and remove private or unrelated information before submitting.
+      render: shell
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Include workarounds, unusual sensor behavior, firmware changes, or reproducible failure steps.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I reviewed this report and its attachments for usernames, hostnames, serial numbers, and unrelated device data.
+          required: true
+        - label: I selected only tests I actually performed and clearly marked anything untested.
+          required: true

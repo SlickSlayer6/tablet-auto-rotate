@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include ROADMAP.md
+recursive-include examples *.lua
+recursive-include profiles *.toml
+recursive-include docs *
+recursive-include packaging *.in

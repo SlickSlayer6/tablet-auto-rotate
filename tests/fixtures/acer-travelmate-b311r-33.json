@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "machine": {
+    "manufacturer": "Acer",
+    "model": "TravelMate B311R-33",
+    "evidence": "maintainer-verified"
+  },
+  "switches": [
+    {
+      "path": "/dev/input/event19",
+      "name": "Intel HID switches",
+      "switch_codes": [1]
+    },
+    {
+      "path": "/dev/input/event0",
+      "name": "Lid Switch",
+      "switch_codes": [0]
+    }
+  ],
+  "iio": [
+    {
+      "name": "accel_3d",
+      "hid_hub": "001F:8087:0AC2.<instance>",
+      "has_xyz_raw": true,
+      "has_scale": true
+    },
+    {
+      "name": "hinge",
+      "hid_hub": "001F:8087:0AC2.<instance>"
+    }
+  ],
+  "expected": {
+    "switch_name": "Intel HID switches",
+    "switch_status": "selected",
+    "accelerometer_strategy": "shared-hinge-hub"
+  }
+}
