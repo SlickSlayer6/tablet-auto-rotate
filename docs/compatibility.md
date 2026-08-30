@@ -8,8 +8,8 @@ works from a single report.
 
 | Level | Requirements | What it means |
 | --- | --- | --- |
-| Reported | A community report identifies the exact model, relevant software versions, configuration, and observed results. | One person reports the stated behavior; it is not reproduced by CI or maintainers. |
-| Fixture-tested | A sanitized hardware fixture and expected result exercise discovery and command behavior in automated tests. | Future code changes are checked against the submitted machine description, but CI does not test physical sensors or touch alignment. |
+| Reported | A community report identifies the exact model, relevant software versions, configuration, and observed results. | One person reports the stated behavior; it is not reproduced by the automated test suite or maintainers. |
+| Fixture-tested | A sanitized hardware fixture and expected result exercise discovery and command behavior in the automated test suite. | Maintainers can check future changes against the submitted machine description, but fixtures do not test physical sensors or touch alignment. |
 | Physically verified | A contributor completes the physical test checklist on the named hardware and records the result. | The reported hardware exercised tablet mode, rotation, and applicable input alignment; maintainers may not own it. |
 | Maintainer-verified | A maintainer personally completes the physical test checklist on the named hardware and records the result. | A maintainer reproduced the result on physical hardware. This is not a warranty for every revision or software version. |
 

@@ -1,7 +1,7 @@
 # Hardware fixtures
 
 Fixtures let community hardware reports improve discovery regression coverage
-without giving CI access to a physical laptop. They describe only the minimum
+without requiring access to a physical laptop. They describe only the minimum
 sanitized facts needed to select devices and predict behavior.
 
 JSON fixtures live under `tests/fixtures`, use `schema_version: 1`, and contain:
