@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add a bounded AI-assisted setup prompt covering safe installation, discovery,
+  calibration, physical validation, persistent startup, and rollback reporting.
+
 ## 0.4.0
 
 - Add validated Linux IIO mount-matrix discovery and application with
