@@ -1841,7 +1841,6 @@ class SensorReader:
         self._generation = 0
         self._worker: Optional[threading.Thread] = None
         self._worker_started = 0.0
-        self._worker_busy = False
         self._read_pending = False
         self._condition = threading.Condition()
         self._request: Optional[tuple[int, Optional[AccelDevice]]] = None
@@ -1873,7 +1872,6 @@ class SensorReader:
                         return
                     generation, device = self._request
                     self._request = None
-                    self._worker_busy = device is not None
 
                 if device is None:
                     if session is not None:
@@ -1905,8 +1903,6 @@ class SensorReader:
                     session_device = None
                     session_generation = None
                 self._results.put((generation, reading, error))
-                with self._condition:
-                    self._worker_busy = False
         finally:
             if session is not None:
                 session.close()
@@ -1926,7 +1922,7 @@ class SensorReader:
                 # the reset sentinel cancels that read and no result will
                 # arrive.  An in-flight read still owns _read_pending until
                 # its generation-tagged result can be drained and discarded.
-                if queued_read and not self._worker_busy:
+                if queued_read:
                     self._read_pending = False
                 self._condition.notify()
 

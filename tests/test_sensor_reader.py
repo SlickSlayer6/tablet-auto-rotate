@@ -139,6 +139,38 @@ def test_reset_cancels_a_request_not_yet_taken_by_worker(monkeypatch):
     reader.close()
 
 
+def test_reset_cancels_prefetch_queued_before_worker_finishes_bookkeeping(
+    monkeypatch,
+):
+    expected = core.AccelReading(
+        (1, 2, 0), (1.0, 1.0, 1.0), (1.0, 2.0, 0.0)
+    )
+
+    class IdleWorker:
+        def join(self, timeout=None):
+            pass
+
+    reader = core.SensorReader(RecordingLogger())
+    reader.device = device()
+    reader._worker = IdleWorker()
+    # Model the reviewed interleaving: the worker has published its result but
+    # has not yet cleared the old busy marker when policy queues a prefetch.
+    reader._worker_busy = True
+    reader._read_pending = True
+    reader._results.put((0, expected, None))
+    monkeypatch.setattr(reader, "_ensure_worker", lambda: None)
+
+    assert reader.read(1.0) == expected
+    assert reader._read_pending
+    assert reader._request == (0, reader.device)
+
+    reader.reset()
+
+    assert not reader._read_pending
+    assert reader._request == (1, None)
+    reader.close()
+
+
 def test_read_error_closes_session_and_rediscovers_before_reopening(monkeypatch):
     expected = core.AccelReading(
         (1, 2, 0), (1.0, 1.0, 1.0), (1.0, 2.0, 0.0)
