@@ -58,9 +58,9 @@ from .orientation import (
     MAX_SECONDARY_RATIO,
     STABILITY_DOT,
     STABILITY_MAGNITUDE_RATIO,
-    OrientationFilter,
-    classify_orientation,
-    map_sensor_values,
+    OrientationFilter as _OrientationFilter,
+    classify_orientation as _classify_orientation,
+    map_sensor_values as _map_sensor_values,
 )
 
 
@@ -96,6 +96,29 @@ def _runtime_from_globals() -> RuntimeConfig:
         orientation_transforms=ORIENTATION_TRANSFORMS,
         mount_matrix=MOUNT_MATRIX_MODE,
     )
+
+
+def classify_orientation(
+    values: Sequence[float], runtime: Optional[RuntimeConfig] = None
+) -> Optional[int]:
+    """Compatibility facade using the current legacy defaults when omitted."""
+
+    return _classify_orientation(values, runtime or _runtime_from_globals())
+
+
+def map_sensor_values(
+    values: Sequence[float], runtime: Optional[RuntimeConfig] = None
+) -> tuple[float, float, float]:
+    """Compatibility facade using the current legacy defaults when omitted."""
+
+    return _map_sensor_values(values, runtime or _runtime_from_globals())
+
+
+class OrientationFilter(_OrientationFilter):
+    """Compatibility facade whose omitted runtime follows ``apply_config``."""
+
+    def __init__(self, runtime: Optional[RuntimeConfig] = None) -> None:
+        super().__init__(runtime or _runtime_from_globals())
 
 # Linux input ABI constants.  The 64-bit input_event layout is timeval
 # (long long, long long), u16, u16, s32: qqHHi, 24 bytes on this machine.
@@ -2332,12 +2355,19 @@ class RotationDaemon:
     def _process_once(self, now: float) -> None:
         self.switch.poll(now)
         self._handle_switch_state(now)
-        if self.hyprland_events is not None and self.hyprland_events.poll(now):
-            # A config reload may preserve the monitor transform while losing
-            # the touch mapping.  Forget the prior paired apply so the fresh
-            # reconciliation re-establishes both in one guarded mutation.
-            self.last_applied_transform = None
-            self.next_monitor_check = now
+        if self.hyprland_events is not None:
+            was_connected = self.hyprland_events.connected
+            if self.hyprland_events.poll(now):
+                # A config reload may preserve the monitor transform while
+                # losing the touch mapping. Forget the prior paired apply so
+                # reconciliation re-establishes both in one guarded mutation.
+                self.last_applied_transform = None
+                self.next_monitor_check = now
+            if was_connected and not self.hyprland_events.connected:
+                self.next_monitor_check = min(
+                    self.next_monitor_check,
+                    now + MONITOR_CHECK_INTERVAL,
+                )
         self._advance_layer_remap(now)
         if self.tablet_mode is True and now >= self.next_sensor_sample:
             self._sample_sensor(now)

@@ -477,6 +477,45 @@ def test_hyprland_event_reestablishes_paired_touch_transform():
         close_daemon(daemon)
 
 
+def test_event_socket_loss_clamps_pending_heartbeat_to_polling_fallback():
+    class Switch:
+        fd = None
+        state = None
+
+        def poll(self, _now):
+            pass
+
+        def next_deadline(self):
+            return 20.0
+
+    class Events:
+        connected = True
+        fd = None
+
+        def poll(self, _now):
+            self.connected = False
+            return False
+
+        def next_deadline(self):
+            return float("inf")
+
+        def close(self):
+            pass
+
+    daemon = core.RotationDaemon(
+        RecordingLogger(),
+        switch=Switch(),
+        hyprland_events=Events(),
+    )
+    daemon.next_monitor_check = 10.0
+    try:
+        daemon._process_once(1.0)
+
+        assert daemon.next_monitor_check == 1.0 + core.MONITOR_CHECK_INTERVAL
+    finally:
+        close_daemon(daemon)
+
+
 def test_apply_eval_keeps_touch_check_immediately_before_mutation(monkeypatch):
     calls = []
     selected_runtime = runtime(output="DSI-1", touch_device="touch-one")

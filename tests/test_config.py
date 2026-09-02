@@ -50,8 +50,9 @@ mount_matrix = "auto"
     assert core.TOUCH_DEVICE_NAME == "example-touch"
     assert core.DESKTOP_INTEGRATION == "none"
     assert core.MOUNT_MATRIX_MODE == "auto"
-    assert core.map_sensor_values((10.0, 20.0, 30.0), runtime) == (-20.0, 10.0, 30.0)
-    assert core.classify_orientation((core.GRAVITY, 0.0, 0.0), runtime) == 3
+    assert core.map_sensor_values((10.0, 20.0, 30.0)) == (-20.0, 10.0, 30.0)
+    assert core.classify_orientation((core.GRAVITY, 0.0, 0.0)) == 3
+    assert core.OrientationFilter().runtime == runtime
 
 
 @pytest.mark.parametrize(
