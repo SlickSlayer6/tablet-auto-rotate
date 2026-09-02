@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 import struct
+from dataclasses import replace
 
 import pytest
 
 from tablet_auto_rotate import core
+from tablet_auto_rotate.config import HardwareConfig, RuntimeConfig
 
 
 @pytest.mark.parametrize(
@@ -58,10 +60,15 @@ def test_eval_command_rejects_non_allowlisted_transforms(invalid):
         core.build_eval_command(invalid)
 
 
-def test_eval_command_quotes_configured_names(monkeypatch):
-    monkeypatch.setattr(core, "OUTPUT_NAME", 'panel"; error("no") --')
-    monkeypatch.setattr(core, "TOUCH_DEVICE_NAME", "touch\\device\nname")
-    command = core.build_eval_command(1)
+def test_eval_command_quotes_configured_names():
+    runtime = RuntimeConfig.from_hardware(
+        replace(
+            HardwareConfig(),
+            output='panel"; error("no") --',
+            touch_device="touch\\device\nname",
+        )
+    )
+    command = core.build_eval_command(1, runtime)
     assert 'output = "panel\\\"; error(\\\"no\\\") --"' in command
     assert 'name = "touch\\\\device\\nname"' in command
     assert command.count("hl.monitor(") == 1

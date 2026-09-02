@@ -21,7 +21,7 @@ def configure_topology(monkeypatch, names, hubs):
     monkeypatch.setattr(
         core,
         "_make_accel_device",
-        lambda path, hinge, hub: fake_device(path, hinge, hub),
+        lambda path, hinge, hub, _runtime=None: fake_device(path, hinge, hub),
     )
 
 

@@ -21,6 +21,7 @@ def test_load_and_apply_machine_mapping(tmp_path, monkeypatch):
         "AXIS_ORDER",
         "AXIS_SIGNS",
         "ORIENTATION_TRANSFORMS",
+        "MOUNT_MATRIX_MODE",
     ):
         monkeypatch.setattr(core, name, getattr(core, name))
     path = write_config(
@@ -43,13 +44,14 @@ mount_matrix = "auto"
 
     loaded = config.load_config(path, required=True)
     core.apply_config(loaded)
+    runtime = config.RuntimeConfig.from_hardware(loaded)
 
     assert core.OUTPUT_NAME == "DSI-1"
     assert core.TOUCH_DEVICE_NAME == "example-touch"
     assert core.DESKTOP_INTEGRATION == "none"
     assert core.MOUNT_MATRIX_MODE == "auto"
-    assert core.map_sensor_values((10.0, 20.0, 30.0)) == (-20.0, 10.0, 30.0)
-    assert core.classify_orientation((core.GRAVITY, 0.0, 0.0)) == 3
+    assert core.map_sensor_values((10.0, 20.0, 30.0), runtime) == (-20.0, 10.0, 30.0)
+    assert core.classify_orientation((core.GRAVITY, 0.0, 0.0), runtime) == 3
 
 
 @pytest.mark.parametrize(

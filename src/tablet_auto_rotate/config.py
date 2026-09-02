@@ -9,7 +9,7 @@ import tomllib
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HardwareConfig:
     """Machine-specific identifiers and orientation policy."""
 
@@ -22,6 +22,36 @@ class HardwareConfig:
     axis_signs: tuple[int, int, int] = (1, 1, 1)
     orientation_transforms: tuple[int, int, int, int] = (1, 2, 3, 0)
     mount_matrix: str = "ignore"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    """Validated and precomputed settings used by the running daemon."""
+
+    output: str
+    touch_device: str
+    switch_name: str
+    preferred_switch_path: str
+    desktop_integration: str
+    axis_order: tuple[int, int, int]
+    axis_signs: tuple[int, int, int]
+    orientation_transforms: tuple[int, int, int, int]
+    mount_matrix: str
+
+    @classmethod
+    def from_hardware(cls, config: HardwareConfig) -> "RuntimeConfig":
+        axis_indexes = {"x": 0, "y": 1, "z": 2}
+        return cls(
+            output=config.output,
+            touch_device=config.touch_device,
+            switch_name=config.switch_name,
+            preferred_switch_path=config.preferred_switch_path,
+            desktop_integration=config.desktop_integration,
+            axis_order=tuple(axis_indexes[axis] for axis in config.axis_order),
+            axis_signs=config.axis_signs,
+            orientation_transforms=config.orientation_transforms,
+            mount_matrix=config.mount_matrix,
+        )
 
 
 def default_config_path() -> Path:

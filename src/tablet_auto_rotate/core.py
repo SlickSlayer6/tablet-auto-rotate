@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Safely rotate the internal display and its touch device in tablet mode.
 
-This daemon intentionally uses only the Linux input/IIO sysfs interfaces and
-the Hyprland and Omarchy command line interfaces.  It never grabs the switch
-device or changes monitor scale, mode, or enabled state.  After a confirmed
-output transform change it nudges the output origin briefly so Omarchy can
-remap existing layer surfaces, with a full Omarchy shell restart as fallback.
-The input and sensor devices are discovered again after they disappear so that
-suspend/resume and driver reloads do not require a restart.
+This daemon intentionally uses only the Linux input/IIO sysfs interfaces,
+Hyprland's read-only event socket, and the Hyprland and Omarchy command line
+interfaces.  It never grabs the switch device or changes monitor scale, mode,
+or enabled state.  After a confirmed output transform change it nudges the
+output origin briefly so Omarchy can remap existing layer surfaces, with a
+full Omarchy shell restart as fallback.  The input and sensor devices are
+discovered again after they disappear so suspend/resume and driver reloads do
+not require a restart.
 """
 
 from __future__ import annotations
@@ -17,14 +18,15 @@ import errno
 import fcntl
 import glob
 import json
-from importlib.metadata import PackageNotFoundError, version
 import math
 import os
 from pathlib import Path
 import queue
 import re
+import select
 import signal
 import shutil
+import socket
 import stat
 import struct
 import subprocess
@@ -34,7 +36,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
-from .config import HardwareConfig, default_config_path, load_config
+from ._version import application_version
+from .config import HardwareConfig, RuntimeConfig, default_config_path, load_config
 from .discovery import (
     SwitchCandidate as DiscoverySwitchCandidate,
     SwitchSelection,
@@ -44,25 +47,55 @@ from .discovery import (
 )
 from .lifecycle import LifecycleError, install as install_service, uninstall as uninstall_service
 from .calibration import CalibrationError, generate_config_toml, infer_axis_mapping
+from .orientation import (
+    CANDIDATE_HOLD_SECONDS,
+    GRAVITY,
+    MAX_ACCEL_MAGNITUDE,
+    MAX_SAMPLE_GAP_SECONDS,
+    MIN_ACCEL_MAGNITUDE,
+    MIN_CARDINAL_RATIO,
+    MIN_PLANAR_RATIO,
+    MAX_SECONDARY_RATIO,
+    STABILITY_DOT,
+    STABILITY_MAGNITUDE_RATIO,
+    OrientationFilter,
+    classify_orientation,
+    map_sensor_values,
+)
 
 
 SCRIPT_NAME = "tablet-auto-rotate"
 REPORT_SCHEMA_VERSION = 1
-SOURCE_VERSION = "0.4.1+source"
-
-# Device names and paths for this machine.
-PREFERRED_SWITCH_PATH = "/dev/input/by-path/platform-INTC1070:00-event"
+# Legacy facade constants are derived from the sole hardware-default source.
+_DEFAULT_HARDWARE = HardwareConfig()
+PREFERRED_SWITCH_PATH = _DEFAULT_HARDWARE.preferred_switch_path
 INPUT_EVENT_PATH = "/dev/input"
 INPUT_SYSFS_GLOB = "/sys/class/input/event*/device/name"
-SWITCH_NAME = "Intel HID switches"
-OUTPUT_NAME = "eDP-1"
-TOUCH_DEVICE_NAME = "elan9004:00-04f3:4110"
+SWITCH_NAME = _DEFAULT_HARDWARE.switch_name
+OUTPUT_NAME = _DEFAULT_HARDWARE.output
+TOUCH_DEVICE_NAME = _DEFAULT_HARDWARE.touch_device
 IIO_DEVICES_PATH = "/sys/bus/iio/devices"
-DESKTOP_INTEGRATION = "omarchy"
-AXIS_ORDER = (0, 1, 2)
-AXIS_SIGNS = (1, 1, 1)
-ORIENTATION_TRANSFORMS = (1, 2, 3, 0)  # +X, +Y, -X, -Y
-MOUNT_MATRIX_MODE = "ignore"
+DESKTOP_INTEGRATION = _DEFAULT_HARDWARE.desktop_integration
+AXIS_ORDER = RuntimeConfig.from_hardware(_DEFAULT_HARDWARE).axis_order
+AXIS_SIGNS = _DEFAULT_HARDWARE.axis_signs
+ORIENTATION_TRANSFORMS = _DEFAULT_HARDWARE.orientation_transforms
+MOUNT_MATRIX_MODE = _DEFAULT_HARDWARE.mount_matrix
+
+
+def _runtime_from_globals() -> RuntimeConfig:
+    """Build compatibility settings for direct calls to legacy core helpers."""
+
+    return RuntimeConfig(
+        output=OUTPUT_NAME,
+        touch_device=TOUCH_DEVICE_NAME,
+        switch_name=SWITCH_NAME,
+        preferred_switch_path=PREFERRED_SWITCH_PATH,
+        desktop_integration=DESKTOP_INTEGRATION,
+        axis_order=AXIS_ORDER,
+        axis_signs=AXIS_SIGNS,
+        orientation_transforms=ORIENTATION_TRANSFORMS,
+        mount_matrix=MOUNT_MATRIX_MODE,
+    )
 
 # Linux input ABI constants.  The 64-bit input_event layout is timeval
 # (long long, long long), u16, u16, s32: qqHHi, 24 bytes on this machine.
@@ -91,7 +124,12 @@ IOC_DIRSHIFT = 30
 LOOP_INTERVAL = 0.10
 SWITCH_RESYNC_INTERVAL = 5.0
 DEVICE_RETRY_INTERVAL = 1.0
+MAX_DEVICE_RETRY_INTERVAL = 10.0
 MONITOR_CHECK_INTERVAL = 2.0
+EVENT_MONITOR_CHECK_INTERVAL = 5.0
+HYPRLAND_EVENT_RETRY_INTERVAL = 2.0
+HYPRLAND_EVENT_BUFFER_LIMIT = 64 * 1024
+HYPRLAND_EVENT_LINE_LIMIT = 4096
 POST_APPLY_VERIFY_ATTEMPTS = 3
 POST_APPLY_VERIFY_DELAY = 0.075
 HYPRCTL_TIMEOUT = 2.0
@@ -107,24 +145,11 @@ MAX_APPLY_RETRY = 10.0
 
 ALLOWED_TRANSFORMS = frozenset((0, 1, 2, 3))
 
-# Accelerometer values are in m/s^2 with the scale exposed by the HID sensor.
-# These limits allow normal tilt while rejecting no-gravity and movement
-# samples.  The direction checks below reject a screen lying flat and
-# orientations too close to a diagonal.
-GRAVITY = 9.80665
-MIN_ACCEL_MAGNITUDE = 0.65 * GRAVITY
-MAX_ACCEL_MAGNITUDE = 1.35 * GRAVITY
-MIN_PLANAR_RATIO = 0.70
-MIN_CARDINAL_RATIO = 0.70
-MAX_SECONDARY_RATIO = 0.55
-STABILITY_DOT = 0.96
-STABILITY_MAGNITUDE_RATIO = 0.20
-CANDIDATE_HOLD_SECONDS = 0.35
-MAX_SAMPLE_GAP_SECONDS = 0.25
 SENSOR_READ_WARNING_SECONDS = 0.50
+_DEFAULT_COMPONENT = object()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SwitchDevice:
     """A validated evdev switch node and the sysfs name used to validate it."""
 
@@ -134,7 +159,7 @@ class SwitchDevice:
     name: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AccelDevice:
     """A conservatively selected display accelerometer and optional hinge."""
 
@@ -149,7 +174,7 @@ class AccelDevice:
     mount_matrix_error: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AccelReading:
     """One raw and scaled accelerometer sample."""
 
@@ -158,7 +183,7 @@ class AccelReading:
     values: Tuple[float, float, float]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MonitorStatus:
     """The small part of a Hyprland monitor description this daemon needs."""
 
@@ -196,6 +221,44 @@ class Logger:
         if previous is None or now - previous >= interval:
             self._last_error[key] = now
             self._write(f"error: {message}")
+
+
+def _run_command(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    logger: Logger,
+    error_key: str,
+    action: str,
+    report_errors: bool = True,
+) -> Optional[subprocess.CompletedProcess[str]]:
+    """Run one bounded command and normalize failure reporting."""
+
+    try:
+        result = subprocess.run(
+            list(argv),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        if report_errors:
+            logger.error(error_key, f"{action}: {exc}")
+        return None
+    if result.returncode == 0:
+        return result
+    detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+    if len(detail) > 160:
+        detail = detail[:157] + "..."
+    if report_errors:
+        logger.error(
+            error_key,
+            f"{action} failed ({result.returncode}){': ' + detail if detail else ''}",
+        )
+    return None
 
 
 def _read_text(path: str) -> str:
@@ -259,15 +322,18 @@ def _event_path_sort_key(path: str) -> Tuple[int, str]:
     return (number if number is not None else 2**31, path)
 
 
-def discover_switch_selection() -> tuple[SwitchSelection, dict[str, SwitchDevice]]:
+def discover_switch_selection(
+    runtime: Optional[RuntimeConfig] = None,
+) -> tuple[SwitchSelection, dict[str, SwitchDevice]]:
     """Select a unique SW_TABLET_MODE device and retain diagnostic reasons."""
 
+    runtime = runtime or _runtime_from_globals()
     devices: list[SwitchDevice] = []
     seen_events: set[str] = set()
 
     preferred = (
-        None if PREFERRED_SWITCH_PATH == "auto"
-        else _validate_switch_path(PREFERRED_SWITCH_PATH)
+        None if runtime.preferred_switch_path == "auto"
+        else _validate_switch_path(runtime.preferred_switch_path)
     )
     if preferred is not None:
         devices.append(preferred)
@@ -307,27 +373,31 @@ def discover_switch_selection() -> tuple[SwitchSelection, dict[str, SwitchDevice
     selection = select_tablet_switch(
         observations,
         configured_path=(
-            PREFERRED_SWITCH_PATH if PREFERRED_SWITCH_PATH in known_paths else None
+            runtime.preferred_switch_path
+            if runtime.preferred_switch_path in known_paths
+            else None
         ),
-        configured_name=None if SWITCH_NAME == "auto" else SWITCH_NAME,
+        configured_name=None if runtime.switch_name == "auto" else runtime.switch_name,
     )
     return selection, by_path
 
 
-def discover_switch_candidates() -> list[SwitchDevice]:
+def discover_switch_candidates(
+    runtime: Optional[RuntimeConfig] = None,
+) -> list[SwitchDevice]:
     """Return only a conservatively selected tablet-mode switch."""
 
-    selection, by_path = discover_switch_selection()
+    selection, by_path = discover_switch_selection(runtime)
     if selection.selected is None:
         return []
     selected = by_path.get(selection.selected.path)
     return [selected] if selected is not None else []
 
 
-def discover_switch() -> Optional[SwitchDevice]:
+def discover_switch(runtime: Optional[RuntimeConfig] = None) -> Optional[SwitchDevice]:
     """Return the first validated switch candidate, if one exists."""
 
-    candidates = discover_switch_candidates()
+    candidates = discover_switch_candidates(runtime)
     return candidates[0] if candidates else None
 
 
@@ -396,16 +466,19 @@ def find_hid_hub_ancestor(path: str) -> Optional[str]:
     return matches[-1] if matches else None
 
 
+_IIO_DEVICE_NUMBER = re.compile(r"iio:device([0-9]+)$")
+
+
+def _iio_device_sort_key(path: str) -> tuple[int, str]:
+    match = _IIO_DEVICE_NUMBER.search(path)
+    return (int(match.group(1)) if match else 2**31, path)
+
+
 def _iio_device_dirs() -> list[str]:
     return sorted(
         (path for path in glob.glob(os.path.join(IIO_DEVICES_PATH, "iio:device*"))
          if os.path.isdir(path)),
-        key=lambda path: (
-            int(re.search(r"iio:device([0-9]+)$", path).group(1))
-            if re.search(r"iio:device([0-9]+)$", path)
-            else 2**31,
-            path,
-        ),
+        key=_iio_device_sort_key,
     )
 
 
@@ -457,15 +530,24 @@ def apply_mount_matrix(
     return transformed  # type: ignore[return-value]
 
 
-def _mounted_values(device: AccelDevice, values: Sequence[float]) -> Tuple[float, float, float]:
-    if MOUNT_MATRIX_MODE in {"auto", "require"} and device.mount_matrix is not None:
+def _mounted_values(
+    device: AccelDevice,
+    values: Sequence[float],
+    runtime: Optional[RuntimeConfig] = None,
+) -> Tuple[float, float, float]:
+    runtime = runtime or _runtime_from_globals()
+    if runtime.mount_matrix in {"auto", "require"} and device.mount_matrix is not None:
         return apply_mount_matrix(device.mount_matrix, values)
     return tuple(values)  # type: ignore[return-value]
 
 
 def _make_accel_device(
-    iio_path: str, hinge_path: str, hid_hub: str
+    iio_path: str,
+    hinge_path: str,
+    hid_hub: str,
+    runtime: Optional[RuntimeConfig] = None,
 ) -> Optional[AccelDevice]:
+    runtime = runtime or _runtime_from_globals()
     name_path = os.path.join(iio_path, "name")
     raw_paths = tuple(
         os.path.join(iio_path, f"in_accel_{axis}_raw") for axis in ("x", "y", "z")
@@ -495,7 +577,7 @@ def _make_accel_device(
         except (OSError, UnicodeError, ValueError) as exc:
             mount_matrix_error = str(exc)
         break
-    if MOUNT_MATRIX_MODE == "require" and mount_matrix is None:
+    if runtime.mount_matrix == "require" and mount_matrix is None:
         return None
     return AccelDevice(
         iio_path=iio_path,
@@ -510,7 +592,7 @@ def _make_accel_device(
     )
 
 
-def discover_accel() -> Optional[AccelDevice]:
+def discover_accel(runtime: Optional[RuntimeConfig] = None) -> Optional[AccelDevice]:
     """Conservatively select the display accelerometer.
 
     Prefer a unique readable accel sharing a HID hub with a hinge sensor. If
@@ -518,6 +600,7 @@ def discover_accel() -> Optional[AccelDevice]:
     Multiple equally plausible devices are intentionally left unresolved.
     """
 
+    runtime = runtime or _runtime_from_globals()
     hinges: list[Tuple[str, str]] = []
     accels: list[Tuple[str, str]] = []
     for iio_path in _iio_device_dirs():
@@ -537,7 +620,7 @@ def discover_accel() -> Optional[AccelDevice]:
         for accel_path, accel_hub in accels:
             if hinge_hub != accel_hub:
                 continue
-            device = _make_accel_device(accel_path, hinge_path, accel_hub)
+            device = _make_accel_device(accel_path, hinge_path, accel_hub, runtime)
             if device is not None:
                 matched.append(device)
     unique_matched = {device.iio_path: device for device in matched}
@@ -548,13 +631,15 @@ def discover_accel() -> Optional[AccelDevice]:
 
     readable: list[AccelDevice] = []
     for accel_path, accel_hub in accels:
-        device = _make_accel_device(accel_path, "", accel_hub)
+        device = _make_accel_device(accel_path, "", accel_hub, runtime)
         if device is not None:
             readable.append(device)
     return readable[0] if len(readable) == 1 else None
 
 
-def read_accel(device: AccelDevice) -> AccelReading:
+def read_accel(
+    device: AccelDevice, runtime: Optional[RuntimeConfig] = None
+) -> AccelReading:
     """Read raw x/y/z and their world-unit scale from IIO sysfs."""
 
     raw = tuple(int(_read_text(path), 10) for path in device.raw_paths)
@@ -563,13 +648,15 @@ def read_accel(device: AccelDevice) -> AccelReading:
         raise ValueError("invalid accelerometer scale")
     physical_values = tuple(raw_value * scale_value
                             for raw_value, scale_value in zip(raw, scale))
-    values = _mounted_values(device, physical_values)
+    values = _mounted_values(device, physical_values, runtime)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("invalid accelerometer sample")
     return AccelReading(raw=raw, scale=scale, values=values)  # type: ignore[arg-type]
 
 
-def read_orientation_accel(device: AccelDevice) -> AccelReading:
+def read_orientation_accel(
+    device: AccelDevice, runtime: Optional[RuntimeConfig] = None
+) -> AccelReading:
     """Read only physical axes mapped to logical screen X/Y.
 
     Screen orientation does not need the logical Z component: a flat screen is
@@ -578,15 +665,16 @@ def read_orientation_accel(device: AccelDevice) -> AccelReading:
     Full three-axis reads remain available to probe and calibration commands.
     """
 
-    if MOUNT_MATRIX_MODE in {"auto", "require"} and device.mount_matrix is not None:
+    runtime = runtime or _runtime_from_globals()
+    if runtime.mount_matrix in {"auto", "require"} and device.mount_matrix is not None:
         required = {
             physical_axis
-            for mounted_axis in AXIS_ORDER[:2]
+            for mounted_axis in runtime.axis_order[:2]
             for physical_axis, coefficient in enumerate(device.mount_matrix[mounted_axis])
             if abs(coefficient) > 1e-12
         }
     else:
-        required = set(AXIS_ORDER[:2])
+        required = set(runtime.axis_order[:2])
     raw_values = [0, 0, 0]
     scale_values = [1.0, 1.0, 1.0]
     for index in required:
@@ -598,7 +686,7 @@ def read_orientation_accel(device: AccelDevice) -> AccelReading:
         raw_value * scale_value
         for raw_value, scale_value in zip(raw_values, scale_values)
     )
-    values = _mounted_values(device, physical_values)
+    values = _mounted_values(device, physical_values, runtime)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("invalid accelerometer sample")
     return AccelReading(
@@ -608,143 +696,94 @@ def read_orientation_accel(device: AccelDevice) -> AccelReading:
     )
 
 
-def _vector_magnitude(values: Sequence[float]) -> float:
-    return math.sqrt(sum(value * value for value in values))
+def _required_orientation_axes(
+    device: AccelDevice, runtime: RuntimeConfig
+) -> tuple[int, ...]:
+    if runtime.mount_matrix in {"auto", "require"} and device.mount_matrix is not None:
+        required = {
+            physical_axis
+            for mounted_axis in runtime.axis_order[:2]
+            for physical_axis, coefficient in enumerate(
+                device.mount_matrix[mounted_axis]
+            )
+            if abs(coefficient) > 1e-12
+        }
+    else:
+        required = set(runtime.axis_order[:2])
+    return tuple(sorted(required))
 
 
-def classify_orientation(values: Sequence[float]) -> Optional[int]:
-    """Classify a stable, cardinal, in-plane gravity vector.
+def _read_fd_text(fd: int, limit: int = 128) -> str:
+    """Read one small sysfs attribute from an already-open descriptor."""
 
-    Transform mapping is intentionally explicit: +Y=2, +X=1, -Y=0, -X=3.
-    A None result means that the current transform must be retained.
-    """
-
-    if len(values) != 3 or not all(math.isfinite(value) for value in values):
-        return None
-    x, y, z = values
-    magnitude = _vector_magnitude(values)
-    if not (MIN_ACCEL_MAGNITUDE <= magnitude <= MAX_ACCEL_MAGNITUDE):
-        return None
-
-    planar = math.hypot(x, y)
-    if planar < MIN_PLANAR_RATIO * magnitude:
-        return None
-
-    absolute_x, absolute_y = abs(x), abs(y)
-    dominant = max(absolute_x, absolute_y)
-    secondary = min(absolute_x, absolute_y)
-    if dominant < MIN_CARDINAL_RATIO * magnitude:
-        return None
-    if dominant <= 0.0 or secondary > MAX_SECONDARY_RATIO * dominant:
-        return None
-
-    if absolute_y > absolute_x:
-        return ORIENTATION_TRANSFORMS[1] if y > 0.0 else ORIENTATION_TRANSFORMS[3]
-    return ORIENTATION_TRANSFORMS[0] if x > 0.0 else ORIENTATION_TRANSFORMS[2]
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = os.read(fd, limit)
+    if len(data) == limit and os.read(fd, 1):
+        raise ValueError("sysfs attribute exceeds read limit")
+    return data.decode("ascii").strip()
 
 
-def map_sensor_values(values: Sequence[float]) -> Tuple[float, float, float]:
-    """Map physical IIO axes into the configured logical screen axes."""
+class AccelSampleSession:
+    """Cached raw descriptors and scale values for one validated IIO device."""
 
-    if len(values) != 3:
-        raise ValueError("accelerometer sample must contain three axes")
-    return tuple(
-        values[index] * sign for index, sign in zip(AXIS_ORDER, AXIS_SIGNS)
-    )  # type: ignore[return-value]
+    def __init__(self, device: AccelDevice, runtime: RuntimeConfig) -> None:
+        self.device = device
+        self.runtime = runtime
+        self.required_axes = _required_orientation_axes(device, runtime)
+        self.raw_fds: dict[int, int] = {}
+        scale_by_path: dict[str, float] = {}
+        scale_values = [1.0, 1.0, 1.0]
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        try:
+            for index in self.required_axes:
+                scale_path = device.scale_paths[index]
+                if scale_path not in scale_by_path:
+                    scale = float(_read_text(scale_path))
+                    if not math.isfinite(scale) or scale == 0.0:
+                        raise ValueError("invalid accelerometer scale")
+                    scale_by_path[scale_path] = scale
+                scale_values[index] = scale_by_path[scale_path]
+                self.raw_fds[index] = os.open(device.raw_paths[index], flags)
+        except BaseException:
+            self.close()
+            raise
+        self.scale = tuple(scale_values)
 
+    def close(self) -> None:
+        raw_fds, self.raw_fds = self.raw_fds, {}
+        for fd in raw_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
-def _unit_vector(values: Sequence[float], magnitude: float) -> Tuple[float, float, float]:
-    return (values[0] / magnitude, values[1] / magnitude, values[2] / magnitude)
-
-
-def _stable_sample(
-    reference: Tuple[float, float, float],
-    current: Tuple[float, float, float],
-    reference_magnitude: float,
-    current_magnitude: float,
-) -> bool:
-    dot = sum(a * b for a, b in zip(reference, current))
-    relative_magnitude_change = (
-        abs(current_magnitude - reference_magnitude) / reference_magnitude
-        if reference_magnitude > 0.0 else math.inf
-    )
-    return dot >= STABILITY_DOT and relative_magnitude_change <= STABILITY_MAGNITUDE_RATIO
-
-
-class OrientationFilter:
-    """Reject movement/diagonals and hold a candidate before accepting it."""
-
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self.candidate: Optional[int] = None
-        self.candidate_since: Optional[float] = None
-        self.reference_unit: Optional[Tuple[float, float, float]] = None
-        self.reference_magnitude: Optional[float] = None
-        self.last_unit: Optional[Tuple[float, float, float]] = None
-        self.last_magnitude: Optional[float] = None
-        self.last_sample_time: Optional[float] = None
-        self.accepted = False
-
-    def _begin_candidate(
-        self,
-        orientation: int,
-        now: float,
-        unit: Tuple[float, float, float],
-        magnitude: float,
-    ) -> None:
-        self.candidate = orientation
-        self.candidate_since = now
-        self.reference_unit = unit
-        self.reference_magnitude = magnitude
-        self.last_unit = unit
-        self.last_magnitude = magnitude
-        self.last_sample_time = now
-        self.accepted = False
-
-    def update(self, values: Sequence[float], now: float) -> Optional[int]:
-        """Return a transform only once a candidate has held for ~350 ms."""
-
-        orientation = classify_orientation(values)
-        if orientation is None:
-            self.reset()
-            return None
-        magnitude = _vector_magnitude(values)
-        unit = _unit_vector(values, magnitude)
-
-        if (
-            self.candidate != orientation
-            or self.candidate_since is None
-            or self.reference_unit is None
-            or self.reference_magnitude is None
-            or self.last_unit is None
-            or self.last_magnitude is None
-            or self.last_sample_time is None
-            or now < self.last_sample_time
-            or now - self.last_sample_time > MAX_SAMPLE_GAP_SECONDS
-        ):
-            self._begin_candidate(orientation, now, unit, magnitude)
-            return None
-
-        if not _stable_sample(
-            self.reference_unit, unit, self.reference_magnitude, magnitude
-        ) or not _stable_sample(
-            self.last_unit, unit, self.last_magnitude, magnitude
-        ):
-            self._begin_candidate(orientation, now, unit, magnitude)
-            return None
-
-        self.last_unit = unit
-        self.last_magnitude = magnitude
-        self.last_sample_time = now
-        if not self.accepted and now - self.candidate_since >= CANDIDATE_HOLD_SECONDS:
-            self.accepted = True
-            return orientation
-        return None
+    def read(self) -> AccelReading:
+        raw_values = [0, 0, 0]
+        for index in self.required_axes:
+            raw_values[index] = int(_read_fd_text(self.raw_fds[index]), 10)
+        physical_values = tuple(
+            raw_value * scale_value
+            for raw_value, scale_value in zip(raw_values, self.scale)
+        )
+        values = _mounted_values(self.device, physical_values, self.runtime)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("invalid accelerometer sample")
+        return AccelReading(
+            raw=tuple(raw_values),  # type: ignore[arg-type]
+            scale=self.scale,  # type: ignore[arg-type]
+            values=values,
+        )
 
 
-def build_eval_command(transform: int) -> str:
+def _open_accel_sample_session(
+    device: AccelDevice, runtime: RuntimeConfig
+) -> AccelSampleSession:
+    return AccelSampleSession(device, runtime)
+
+
+def build_eval_command(
+    transform: int, runtime: Optional[RuntimeConfig] = None
+) -> str:
     """Build the Hyprland monitor/device transform mutation."""
 
     if (
@@ -753,8 +792,9 @@ def build_eval_command(transform: int) -> str:
         or transform not in ALLOWED_TRANSFORMS
     ):
         raise ValueError(f"invalid transform: {transform}")
-    output = lua_string(OUTPUT_NAME)
-    touch = lua_string(TOUCH_DEVICE_NAME)
+    runtime = runtime or _runtime_from_globals()
+    output = lua_string(runtime.output)
+    touch = lua_string(runtime.touch_device)
     return (
         f'hl.monitor({{ output = {output}, transform = {transform} }}); '
         f'hl.device({{ name = {touch}, output = {output}, '
@@ -781,51 +821,42 @@ def _validate_position_coordinate(value: Any, name: str) -> int:
     return value
 
 
-def build_position_eval_command(x: int, y: int) -> str:
+def build_position_eval_command(
+    x: int, y: int, runtime: Optional[RuntimeConfig] = None
+) -> str:
     """Build an eval that changes only eDP-1's position and reloads rendering."""
 
     x = _validate_position_coordinate(x, "x")
     y = _validate_position_coordinate(y, "y")
-    output = lua_string(OUTPUT_NAME)
+    runtime = runtime or _runtime_from_globals()
+    output = lua_string(runtime.output)
     return (
         f'hl.monitor({{ output = {output}, position = "{x}x{y}" }}); '
         'hl.dispatch(hl.dsp.force_renderer_reload())'
     )
 
 
-def apply_monitor_position(x: int, y: int, logger: Logger) -> bool:
+def apply_monitor_position(
+    x: int,
+    y: int,
+    logger: Logger,
+    runtime: Optional[RuntimeConfig] = None,
+) -> bool:
     """Run the restricted position eval without invoking a shell."""
 
     try:
-        command = build_position_eval_command(x, y)
+        command = build_position_eval_command(x, y, runtime)
     except ValueError as exc:
         logger.error("hyprctl-position", f"refusing monitor position: {exc}")
         return False
 
-    try:
-        result = subprocess.run(
-            ["hyprctl", "eval", command],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            timeout=HYPRCTL_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        logger.error("hyprctl-position", f"cannot set monitor position: {exc}")
-        return False
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
-        if len(detail) > 160:
-            detail = detail[:157] + "..."
-        logger.error(
-            "hyprctl-position",
-            f"monitor position {x}x{y} failed ({result.returncode})"
-            f"{': ' + detail if detail else ''}",
-        )
-        return False
-    return True
+    return _run_command(
+        ["hyprctl", "eval", command],
+        timeout=HYPRCTL_TIMEOUT,
+        logger=logger,
+        error_key="hyprctl-position",
+        action=f"set monitor position {x}x{y}",
+    ) is not None
 
 
 def _json_bool(value: Any, default: bool) -> bool:
@@ -946,73 +977,59 @@ def has_touch_device(payload: Any, device_name: Optional[str] = None) -> bool:
     return (TOUCH_DEVICE_NAME if device_name is None else device_name) in parse_touch_device_names(payload)
 
 
-def query_touch_device(logger: Logger) -> Optional[bool]:
+def query_touch_device(
+    logger: Logger, runtime: Optional[RuntimeConfig] = None
+) -> Optional[bool]:
     """Confirm the required touch device exists without changing anything."""
 
-    try:
-        result = subprocess.run(
-            ["hyprctl", "-j", "devices"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            timeout=HYPRCTL_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        logger.error("hyprctl-devices", f"cannot query input devices: {exc}")
-        return None
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
-        if len(detail) > 160:
-            detail = detail[:157] + "..."
-        logger.error(
-            "hyprctl-devices",
-            f"device query failed ({result.returncode}){': ' + detail if detail else ''}",
-        )
+    runtime = runtime or _runtime_from_globals()
+    result = _run_command(
+        ["hyprctl", "-j", "devices"],
+        timeout=HYPRCTL_TIMEOUT,
+        logger=logger,
+        error_key="hyprctl-devices",
+        action="query input devices",
+    )
+    if result is None:
         return None
     try:
         payload = json.loads(result.stdout)
     except (TypeError, ValueError) as exc:
         logger.error("hyprctl-devices-json", f"invalid device JSON: {exc}")
         return None
-    if not has_touch_device(payload):
+    return _query_touch_payload(payload, logger, runtime)
+
+
+def _query_touch_payload(
+    payload: Any, logger: Logger, runtime: RuntimeConfig
+) -> bool:
+    if not has_touch_device(payload, runtime.touch_device):
         logger.error(
             "touch-device-missing",
-            f"required touch device {TOUCH_DEVICE_NAME} not found; waiting before applying transform",
+            f"required touch device {runtime.touch_device} not found; waiting before applying transform",
         )
         return False
     return True
 
 
 def query_monitor_status(
-    logger: Logger, *, report_errors: bool = True
+    logger: Logger,
+    *,
+    report_errors: bool = True,
+    runtime: Optional[RuntimeConfig] = None,
 ) -> Optional[MonitorStatus]:
     """Ask Hyprland for monitor state without invoking a shell."""
 
-    try:
-        result = subprocess.run(
-            ["hyprctl", "-j", "monitors", "all"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            timeout=HYPRCTL_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        if report_errors:
-            logger.error("hyprctl-monitors", f"cannot query monitors: {exc}")
-        return None
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
-        if len(detail) > 160:
-            detail = detail[:157] + "..."
-        if report_errors:
-            logger.error(
-                "hyprctl-monitors",
-                f"monitor query failed ({result.returncode}){': ' + detail if detail else ''}",
-            )
+    runtime = runtime or _runtime_from_globals()
+    result = _run_command(
+        ["hyprctl", "-j", "monitors", "all"],
+        timeout=HYPRCTL_TIMEOUT,
+        logger=logger,
+        error_key="hyprctl-monitors",
+        action="query monitors",
+        report_errors=report_errors,
+    )
+    if result is None:
         return None
     try:
         payload = json.loads(result.stdout)
@@ -1020,9 +1037,9 @@ def query_monitor_status(
         if report_errors:
             logger.error("hyprctl-monitors-json", f"invalid monitor JSON: {exc}")
         return None
-    status = parse_monitor_status(payload)
+    status = parse_monitor_status(payload, runtime.output)
     if not status.found and report_errors:
-        logger.error("monitor-missing", f"monitor {OUTPUT_NAME} not found")
+        logger.error("monitor-missing", f"monitor {runtime.output} not found")
     return status
 
 
@@ -1092,11 +1109,15 @@ def verify_monitor_transform(
     *,
     query: Optional[Callable[[], Optional[MonitorStatus]]] = None,
     sleep: Callable[[float], None] = time.sleep,
-) -> bool:
+    runtime: Optional[RuntimeConfig] = None,
+) -> Optional[MonitorStatus]:
     """Poll briefly until Hyprland reports the requested monitor transform."""
 
+    runtime = runtime or _runtime_from_globals()
     if query is None:
-        query_status = lambda: query_monitor_status(logger, report_errors=False)
+        query_status = lambda: query_monitor_status(
+            logger, report_errors=False, runtime=runtime
+        )
     else:
         query_status = query
 
@@ -1105,13 +1126,13 @@ def verify_monitor_transform(
             sleep(POST_APPLY_VERIFY_DELAY)
         status = query_status()
         if monitor_status_matches(status, transform):
-            return True
+            return status
 
     logger.error(
         "hyprctl-verify",
-        f"monitor {OUTPUT_NAME} did not confirm enabled transform {transform}; retrying",
+        f"monitor {runtime.output} did not confirm enabled transform {transform}; retrying",
     )
-    return False
+    return None
 
 
 def fast_layer_remap(
@@ -1121,9 +1142,12 @@ def fast_layer_remap(
     query: Optional[Callable[[], Optional[MonitorStatus]]] = None,
     set_position: Optional[Callable[[int, int], bool]] = None,
     sleep: Callable[[float], None] = time.sleep,
+    initial_status: Optional[MonitorStatus] = None,
+    runtime: Optional[RuntimeConfig] = None,
 ) -> bool:
     """Nudge and restore the output origin to remap Omarchy layer surfaces."""
 
+    runtime = runtime or _runtime_from_globals()
     if (
         isinstance(transform, bool)
         or not isinstance(transform, int)
@@ -1133,19 +1157,23 @@ def fast_layer_remap(
         return False
 
     if query is None:
-        query_status = lambda: query_monitor_status(logger, report_errors=False)
+        query_status = lambda: query_monitor_status(
+            logger, report_errors=False, runtime=runtime
+        )
     else:
         query_status = query
     if set_position is None:
-        position_setter = lambda x, y: apply_monitor_position(x, y, logger)
+        position_setter = lambda x, y: apply_monitor_position(x, y, logger, runtime)
     else:
         position_setter = set_position
 
-    try:
-        status = query_status()
-    except Exception as exc:
-        logger.error("layer-remap-query", f"cannot query post-transform monitor: {exc}")
-        return False
+    status = initial_status
+    if status is None:
+        try:
+            status = query_status()
+        except Exception as exc:
+            logger.error("layer-remap-query", f"cannot query post-transform monitor: {exc}")
+            return False
     if (
         not monitor_status_matches(status, transform)
         or not _monitor_status_is_single_active(status)
@@ -1153,7 +1181,7 @@ def fast_layer_remap(
     ):
         logger.error(
             "layer-remap-status",
-            f"post-transform monitor {OUTPUT_NAME} lacks the requested transform, integer position, or single active monitor",
+            f"post-transform monitor {runtime.output} lacks the requested transform, integer position, or single active monitor",
         )
         return False
 
@@ -1171,7 +1199,7 @@ def fast_layer_remap(
         if not restored:
             logger.error(
                 "layer-remap-restore",
-                f"monitor {OUTPUT_NAME} position restore to {original_x}x{original_y} failed",
+                f"monitor {runtime.output} position restore to {original_x}x{original_y} failed",
             )
             return False
         return True
@@ -1189,7 +1217,7 @@ def fast_layer_remap(
         return failed(f"cannot nudge monitor position: {exc}")
     if not nudged:
         return failed(
-            f"monitor {OUTPUT_NAME} position nudge to {original_x}x{original_y + 1} failed"
+            f"monitor {runtime.output} position nudge to {original_x}x{original_y + 1} failed"
         )
 
     try:
@@ -1205,7 +1233,7 @@ def fast_layer_remap(
         midpoint_status, transform, original_x, original_y + 1
     ):
         return failed(
-            f"monitor {OUTPUT_NAME} nudge verification failed at {original_x}x{original_y + 1}"
+            f"monitor {runtime.output} nudge verification failed at {original_x}x{original_y + 1}"
         )
 
     try:
@@ -1214,7 +1242,7 @@ def fast_layer_remap(
         return failed(f"cannot restore monitor position: {exc}")
     if not restored:
         return failed(
-            f"monitor {OUTPUT_NAME} position restore to {original_x}x{original_y} failed"
+            f"monitor {runtime.output} position restore to {original_x}x{original_y} failed"
         )
 
     try:
@@ -1230,93 +1258,369 @@ def fast_layer_remap(
         final_status, transform, original_x, original_y
     ):
         return failed(
-            f"monitor {OUTPUT_NAME} position/transform verification failed after fast layer remap"
+            f"monitor {runtime.output} position/transform verification failed after fast layer remap"
         )
 
     logger.debug(
-        f"fast layer remap verified at {OUTPUT_NAME} position {original_x}x{original_y}"
+        f"fast layer remap verified at {runtime.output} position {original_x}x{original_y}"
     )
     return True
 
 
-def apply_eval(transform: int, logger: Logger) -> bool:
+class LayerRemapOperation:
+    """Generation-bound Omarchy remap whose waits are driven by daemon deadlines."""
+
+    def __init__(
+        self,
+        transform: int,
+        generation: int,
+        status: MonitorStatus,
+        client: Any,
+        logger: Logger,
+        runtime: RuntimeConfig,
+    ) -> None:
+        self.transform = transform
+        self.generation = generation
+        self.status = status
+        self.client = client
+        self.logger = logger
+        self.runtime = runtime
+        self.original_x: Optional[int] = None
+        self.original_y: Optional[int] = None
+        self.state = "new"
+        self.deadline = math.inf
+
+    def _restore(self) -> bool:
+        if self.original_x is None or self.original_y is None:
+            return True
+        try:
+            restored = self.client.set_position(self.original_x, self.original_y)
+        except Exception as exc:
+            self.logger.error(
+                "layer-remap-restore", f"cannot restore monitor position: {exc}"
+            )
+            return False
+        if not restored:
+            self.logger.error(
+                "layer-remap-restore",
+                f"monitor {self.runtime.output} position restore to "
+                f"{self.original_x}x{self.original_y} failed",
+            )
+        return bool(restored)
+
+    def _fail(self, message: str, *, restore: bool) -> bool:
+        self.logger.error("layer-remap", message)
+        if restore:
+            self._restore()
+        self.state = "failed"
+        self.deadline = math.inf
+        return False
+
+    def start(self, now: float) -> Optional[bool]:
+        if (
+            not monitor_status_matches(self.status, self.transform)
+            or not _monitor_status_is_single_active(self.status)
+            or not _monitor_status_has_integer_position(self.status)
+        ):
+            return self._fail(
+                f"post-transform monitor {self.runtime.output} lacks the requested "
+                "transform, integer position, or single active monitor",
+                restore=False,
+            )
+        self.original_x = self.status.x
+        self.original_y = self.status.y
+        try:
+            nudged = self.client.set_position(
+                self.original_x, self.original_y + 1
+            )
+        except Exception as exc:
+            return self._fail(
+                f"cannot nudge monitor position: {exc}", restore=True
+            )
+        if not nudged:
+            return self._fail(
+                f"monitor {self.runtime.output} position nudge to "
+                f"{self.original_x}x{self.original_y + 1} failed",
+                restore=True,
+            )
+        self.state = "wait_nudge"
+        self.deadline = now + LAYER_REMAP_NUDGE_DELAY
+        return None
+
+    def advance(self, now: float) -> Optional[bool]:
+        if now < self.deadline:
+            return None
+        if self.state == "wait_nudge":
+            try:
+                midpoint = self.client.query_monitor(report_errors=False)
+            except Exception as exc:
+                return self._fail(
+                    f"cannot verify nudged monitor position: {exc}", restore=True
+                )
+            if not _monitor_status_matches_position(
+                midpoint,
+                self.transform,
+                self.original_x,
+                self.original_y + 1,
+            ):
+                return self._fail(
+                    f"monitor {self.runtime.output} nudge verification failed at "
+                    f"{self.original_x}x{self.original_y + 1}",
+                    restore=True,
+                )
+            if not self._restore():
+                return self._fail(
+                    f"monitor {self.runtime.output} position restore to "
+                    f"{self.original_x}x{self.original_y} failed",
+                    restore=False,
+                )
+            self.state = "wait_settle"
+            self.deadline = now + LAYER_REMAP_SETTLE_DELAY
+            return None
+        if self.state == "wait_settle":
+            try:
+                final_status = self.client.query_monitor(report_errors=False)
+            except Exception as exc:
+                return self._fail(
+                    f"cannot verify restored monitor position: {exc}", restore=True
+                )
+            if not _monitor_status_matches_position(
+                final_status,
+                self.transform,
+                self.original_x,
+                self.original_y,
+            ):
+                return self._fail(
+                    f"monitor {self.runtime.output} position/transform verification "
+                    "failed after fast layer remap",
+                    restore=True,
+                )
+            self.state = "complete"
+            self.deadline = math.inf
+            self.logger.debug(
+                f"fast layer remap verified at {self.runtime.output} position "
+                f"{self.original_x}x{self.original_y}"
+            )
+            return True
+        return self.state == "complete"
+
+    def cancel(self) -> bool:
+        needs_restore = self.state == "wait_nudge"
+        restored = self._restore() if needs_restore else True
+        self.state = "cancelled"
+        self.deadline = math.inf
+        return restored
+
+
+def apply_eval(
+    transform: int,
+    logger: Logger,
+    runtime: Optional[RuntimeConfig] = None,
+) -> Optional[MonitorStatus]:
     """Apply transforms once, then verify the live monitor state."""
 
-    command = build_eval_command(transform)
+    runtime = runtime or _runtime_from_globals()
+    command = build_eval_command(transform, runtime)
     # Do this immediately before the mutation so a missing touch device can
     # never result in a monitor-only transform.
-    if query_touch_device(logger) is not True:
-        return False
-    try:
-        result = subprocess.run(
-            ["hyprctl", "eval", command],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            timeout=HYPRCTL_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        logger.error("hyprctl-eval", f"cannot apply transform {transform}: {exc}")
-        return False
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
-        if len(detail) > 160:
-            detail = detail[:157] + "..."
-        logger.error(
-            "hyprctl-eval",
-            f"transform {transform} failed ({result.returncode})"
-            f"{': ' + detail if detail else ''}",
-        )
-        return False
-    return verify_monitor_transform(transform, logger)
+    if query_touch_device(logger, runtime) is not True:
+        return None
+    if _run_command(
+        ["hyprctl", "eval", command],
+        timeout=HYPRCTL_TIMEOUT,
+        logger=logger,
+        error_key="hyprctl-eval",
+        action=f"apply transform {transform}",
+    ) is None:
+        return None
+    return verify_monitor_transform(transform, logger, runtime=runtime)
 
 
 def restart_omarchy_shell(logger: Logger) -> bool:
     """Restart the Omarchy shell without invoking a shell command interpreter."""
 
-    try:
-        result = subprocess.run(
-            ["omarchy", "restart", "shell"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            timeout=OMARCHY_SHELL_RESTART_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        logger.error("omarchy-shell-restart", f"cannot restart Omarchy shell: {exc}")
-        return False
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
-        if len(detail) > 160:
-            detail = detail[:157] + "..."
-        logger.error(
-            "omarchy-shell-restart",
-            f"Omarchy shell restart failed ({result.returncode})"
-            f"{': ' + detail if detail else ''}",
-        )
+    if _run_command(
+        ["omarchy", "restart", "shell"],
+        timeout=OMARCHY_SHELL_RESTART_TIMEOUT,
+        logger=logger,
+        error_key="omarchy-shell-restart",
+        action="restart Omarchy shell",
+    ) is None:
         return False
     logger.debug("Omarchy shell restarted")
     return True
 
 
-class SwitchReader:
-    """Nonblocking evdev reader with ioctl and SYN_DROPPED recovery."""
+class SubprocessHyprlandClient:
+    """Injectable Hyprland operations backed by short-lived CLI processes."""
+
+    def __init__(self, logger: Logger, runtime: RuntimeConfig) -> None:
+        self.logger = logger
+        self.runtime = runtime
+
+    def query_monitor(self, *, report_errors: bool = True) -> Optional[MonitorStatus]:
+        return query_monitor_status(
+            self.logger,
+            report_errors=report_errors,
+            runtime=self.runtime,
+        )
+
+    def apply_transform(self, transform: int) -> Optional[MonitorStatus]:
+        return apply_eval(transform, self.logger, self.runtime)
+
+    def set_position(self, x: int, y: int) -> bool:
+        return apply_monitor_position(x, y, self.logger, self.runtime)
+
+    def restart_shell(self) -> bool:
+        return restart_omarchy_shell(self.logger)
+
+
+def _hyprland_socket_path(filename: str) -> Optional[str]:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if (
+        not runtime_dir
+        or not os.path.isabs(runtime_dir)
+        or not signature
+        or os.path.basename(signature) != signature
+    ):
+        return None
+    return os.path.join(runtime_dir, "hypr", signature, filename)
+
+
+class HyprlandEventReader:
+    """Nonblocking reader for monitor-related Hyprland socket2 events."""
+
+    RELEVANT_EVENTS = frozenset(
+        {
+            b"monitoradded",
+            b"monitoraddedv2",
+            b"monitorremoved",
+            b"monitorremovedv2",
+            b"configreloaded",
+        }
+    )
 
     def __init__(self, logger: Logger) -> None:
         self.logger = logger
+        self.socket: Optional[socket.socket] = None
+        self._buffer = bytearray()
+        self._next_connect = 0.0
+
+    @property
+    def connected(self) -> bool:
+        return self.socket is not None
+
+    @property
+    def fd(self) -> Optional[int]:
+        return self.socket.fileno() if self.socket is not None else None
+
+    def next_deadline(self) -> float:
+        return math.inf if self.socket is not None else self._next_connect
+
+    def close(self) -> None:
+        current, self.socket = self.socket, None
+        if current is not None:
+            try:
+                current.close()
+            except OSError:
+                pass
+        self._buffer.clear()
+
+    def _lose_connection(self, now: float, reason: str) -> None:
+        had_connection = self.socket is not None
+        self.close()
+        self._next_connect = now + HYPRLAND_EVENT_RETRY_INTERVAL
+        if had_connection:
+            self.logger.error(
+                "hyprland-events",
+                f"Hyprland event socket lost ({reason}); using polling fallback",
+            )
+
+    def _connect(self, now: float) -> None:
+        if self.socket is not None or now < self._next_connect:
+            return
+        path = _hyprland_socket_path(".socket2.sock")
+        if path is None:
+            self._next_connect = now + HYPRLAND_EVENT_RETRY_INTERVAL
+            return
+        candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            candidate.setblocking(False)
+            connect_error = candidate.connect_ex(path)
+            if connect_error:
+                raise OSError(connect_error, os.strerror(connect_error))
+        except OSError as exc:
+            candidate.close()
+            self._next_connect = now + HYPRLAND_EVENT_RETRY_INTERVAL
+            self.logger.error(
+                "hyprland-events-connect",
+                f"cannot connect to Hyprland event socket: {exc}",
+            )
+            return
+        self.socket = candidate
+        self._buffer.clear()
+        self.logger.debug("Hyprland event socket connected")
+
+    def poll(self, now: float) -> bool:
+        self._connect(now)
+        current = self.socket
+        if current is None:
+            return False
+        relevant = False
+        for _ in range(16):
+            try:
+                chunk = current.recv(4096)
+            except BlockingIOError:
+                break
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                self._lose_connection(now, str(exc))
+                return relevant
+            if not chunk:
+                self._lose_connection(now, "end of stream")
+                return relevant
+            self._buffer.extend(chunk)
+            if len(self._buffer) > HYPRLAND_EVENT_BUFFER_LIMIT:
+                self._lose_connection(now, "receive buffer limit exceeded")
+                return relevant
+            while b"\n" in self._buffer:
+                line, _, remainder = self._buffer.partition(b"\n")
+                self._buffer = bytearray(remainder)
+                if len(line) > HYPRLAND_EVENT_LINE_LIMIT:
+                    self._lose_connection(now, "event line limit exceeded")
+                    return relevant
+                event_name, separator, _data = bytes(line).partition(b">>")
+                if separator and event_name in self.RELEVANT_EVENTS:
+                    relevant = True
+            if len(self._buffer) > HYPRLAND_EVENT_LINE_LIMIT:
+                self._lose_connection(now, "event line limit exceeded")
+                return relevant
+        return relevant
+
+
+class SwitchReader:
+    """Nonblocking evdev reader with ioctl and SYN_DROPPED recovery."""
+
+    def __init__(
+        self, logger: Logger, runtime: Optional[RuntimeConfig] = None
+    ) -> None:
+        self.logger = logger
+        self.runtime = runtime or _runtime_from_globals()
         self.fd: Optional[int] = None
         self.device: Optional[SwitchDevice] = None
+        self._candidate: Optional[SwitchDevice] = None
         self.state: Optional[bool] = None
         self._buffer = bytearray()
         self._next_open = 0.0
+        self._open_retry_delay = DEVICE_RETRY_INTERVAL
         self._next_resync = 0.0
         self._discard_after_drop = False
 
     def close(self) -> None:
+        if self.device is not None:
+            self._candidate = self.device
         fd, self.fd = self.fd, None
         if fd is not None:
             try:
@@ -1328,9 +1632,28 @@ class SwitchReader:
         self._buffer.clear()
         self._discard_after_drop = False
 
+    def _cached_configured_candidate(self) -> Optional[SwitchDevice]:
+        candidate = self._candidate
+        if (
+            candidate is None
+            or self.runtime.preferred_switch_path == "auto"
+            or candidate.path != self.runtime.preferred_switch_path
+        ):
+            return None
+        validated = _validate_switch_path(candidate.path, candidate.name)
+        if validated is None:
+            return None
+        try:
+            if SW_TABLET_MODE not in _switch_codes(validated.name_path):
+                return None
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return validated
+
     def _lose_device(self, now: float, reason: str) -> None:
         had_device = self.fd is not None or self.device is not None
         self.close()
+        self._open_retry_delay = DEVICE_RETRY_INTERVAL
         self._next_open = now + DEVICE_RETRY_INTERVAL
         if had_device:
             self.logger.error(
@@ -1338,11 +1661,39 @@ class SwitchReader:
                 f"switch device lost ({reason}); retrying",
             )
 
+    def _schedule_open_retry(self, now: float) -> None:
+        self._next_open = now + self._open_retry_delay
+        self._open_retry_delay = min(
+            self._open_retry_delay * 2.0, MAX_DEVICE_RETRY_INTERVAL
+        )
+
     def _open_if_needed(self, now: float) -> None:
         if self.fd is not None or now < self._next_open:
             return
+        cached = self._cached_configured_candidate()
+        if cached is not None:
+            try:
+                fd, state = open_switch_device(cached)
+            except Exception as exc:
+                self.logger.debug(
+                    f"cannot reopen cached switch {cached.path}: {exc}"
+                )
+            else:
+                self.fd = fd
+                self.device = cached
+                self._candidate = cached
+                self.state = state
+                self._buffer.clear()
+                self._discard_after_drop = False
+                self._next_resync = now + SWITCH_RESYNC_INTERVAL
+                self._open_retry_delay = DEVICE_RETRY_INTERVAL
+                self.logger.info(
+                    f"switch {cached.path} reopened "
+                    f"({'tablet' if state else 'laptop'})"
+                )
+                return
         try:
-            selection, devices = discover_switch_selection()
+            selection, devices = discover_switch_selection(self.runtime)
             candidates = (
                 [devices[selection.selected.path]]
                 if selection.selected is not None
@@ -1350,11 +1701,11 @@ class SwitchReader:
                 else []
             )
         except Exception as exc:
-            self._next_open = now + DEVICE_RETRY_INTERVAL
+            self._schedule_open_retry(now)
             self.logger.error("switch-discovery", f"switch discovery failed: {exc}")
             return
         if not candidates:
-            self._next_open = now + DEVICE_RETRY_INTERVAL
+            self._schedule_open_retry(now)
             self.logger.error(
                 "switch-discovery",
                 f"tablet switch not selected ({selection.summary}); retrying",
@@ -1371,16 +1722,18 @@ class SwitchReader:
                 continue
             self.fd = fd
             self.device = candidate
+            self._candidate = candidate
             self.state = state
             self._buffer.clear()
             self._discard_after_drop = False
             self._next_resync = now + SWITCH_RESYNC_INTERVAL
+            self._open_retry_delay = DEVICE_RETRY_INTERVAL
             self.logger.info(
                 f"switch {candidate.path} opened ({'tablet' if state else 'laptop'})"
             )
             return
 
-        self._next_open = now + DEVICE_RETRY_INTERVAL
+        self._schedule_open_retry(now)
         if last_error is not None:
             self.logger.error(
                 "switch-open",
@@ -1468,50 +1821,162 @@ class SwitchReader:
             self._resync(now, "periodic")
         return self.state
 
+    def next_deadline(self) -> float:
+        """Return the next open or ioctl-resync deadline."""
+
+        return self._next_open if self.fd is None else self._next_resync
+
 
 class SensorReader:
-    """Read IIO asynchronously so a blocked kernel attribute cannot freeze policy."""
+    """Read IIO on one persistent worker so kernel stalls cannot freeze policy."""
 
-    def __init__(self, logger: Logger) -> None:
+    def __init__(
+        self, logger: Logger, runtime: Optional[RuntimeConfig] = None
+    ) -> None:
         self.logger = logger
+        self.runtime = runtime or _runtime_from_globals()
         self.device: Optional[AccelDevice] = None
         self._next_discovery = 0.0
+        self._discovery_retry_delay = DEVICE_RETRY_INTERVAL
         self._generation = 0
         self._worker: Optional[threading.Thread] = None
         self._worker_started = 0.0
-        self._results: queue.SimpleQueue[
+        self._worker_busy = False
+        self._read_pending = False
+        self._condition = threading.Condition()
+        self._request: Optional[tuple[int, Optional[AccelDevice]]] = None
+        self._closing = False
+        self._results: queue.Queue[
             tuple[int, Optional[AccelReading], Optional[BaseException]]
-        ] = queue.SimpleQueue()
+        ] = queue.Queue(maxsize=1)
 
-    def reset(self) -> None:
-        self._generation += 1
-        self.device = None
-        self._next_discovery = 0.0
-
-    def _start_read(self, now: float) -> None:
-        if self.device is None or self._worker is not None:
+    def _ensure_worker(self) -> None:
+        if self._worker is not None:
             return
-        device = self.device
-        generation = self._generation
-
-        def worker() -> None:
-            try:
-                reading = read_orientation_accel(device)
-            except BaseException as exc:
-                self._results.put((generation, None, exc))
-            else:
-                self._results.put((generation, reading, None))
-
-        self._worker_started = now
         self._worker = threading.Thread(
-            target=worker,
+            target=self._worker_main,
             name="tablet-auto-rotate-sensor-read",
             daemon=True,
         )
         self._worker.start()
 
-    def read(self, now: float) -> Optional[AccelReading]:
+    def _worker_main(self) -> None:
+        session: Optional[AccelSampleSession] = None
+        session_device: Optional[AccelDevice] = None
+        session_generation: Optional[int] = None
+        try:
+            while True:
+                with self._condition:
+                    while self._request is None and not self._closing:
+                        self._condition.wait()
+                    if self._closing:
+                        return
+                    generation, device = self._request
+                    self._request = None
+                    self._worker_busy = device is not None
+
+                if device is None:
+                    if session is not None:
+                        session.close()
+                    session = None
+                    session_device = None
+                    session_generation = None
+                    continue
+
+                reading: Optional[AccelReading] = None
+                error: Optional[BaseException] = None
+                try:
+                    if (
+                        session is None
+                        or session_device != device
+                        or session_generation != generation
+                    ):
+                        if session is not None:
+                            session.close()
+                        session = _open_accel_sample_session(device, self.runtime)
+                        session_device = device
+                        session_generation = generation
+                    reading = session.read()
+                except BaseException as exc:
+                    error = exc
+                    if session is not None:
+                        session.close()
+                    session = None
+                    session_device = None
+                    session_generation = None
+                self._results.put((generation, reading, error))
+                with self._condition:
+                    self._worker_busy = False
+        finally:
+            if session is not None:
+                session.close()
+
+    def reset(self) -> None:
+        self._generation += 1
+        self.device = None
+        self._next_discovery = 0.0
+        self._discovery_retry_delay = DEVICE_RETRY_INTERVAL
         if self._worker is not None:
+            with self._condition:
+                queued_read = (
+                    self._request is not None and self._request[1] is not None
+                )
+                self._request = (self._generation, None)
+                # If the worker had not taken the request, replacing it with
+                # the reset sentinel cancels that read and no result will
+                # arrive.  An in-flight read still owns _read_pending until
+                # its generation-tagged result can be drained and discarded.
+                if queued_read and not self._worker_busy:
+                    self._read_pending = False
+                self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closing = True
+            self._request = None
+            self._condition.notify()
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout=0.1)
+
+    def _start_read(self, now: float) -> None:
+        if self.device is None or self._read_pending or self._closing:
+            return
+        self._ensure_worker()
+        self._read_pending = True
+        self._worker_started = now
+        with self._condition:
+            self._request = (self._generation, self.device)
+            self._condition.notify()
+
+    def _select_device(self, now: float) -> bool:
+        if now < self._next_discovery:
+            return False
+        device: Optional[AccelDevice] = None
+        try:
+            device = discover_accel(self.runtime)
+        except Exception as exc:
+            self.logger.error("sensor-discovery", f"sensor discovery failed: {exc}")
+        if device is None:
+            self._next_discovery = now + self._discovery_retry_delay
+            self._discovery_retry_delay = min(
+                self._discovery_retry_delay * 2.0,
+                MAX_DEVICE_RETRY_INTERVAL,
+            )
+            self.logger.error(
+                "sensor-missing",
+                "display accelerometer not found; retrying",
+            )
+            return False
+        self.device = device
+        self._discovery_retry_delay = DEVICE_RETRY_INTERVAL
+        self.logger.info(
+            f"accelerometer {device.iio_path} selected (hub {device.hid_hub})"
+        )
+        return True
+
+    def read(self, now: float) -> Optional[AccelReading]:
+        if self._read_pending:
             try:
                 generation, reading, error = self._results.get_nowait()
             except queue.Empty:
@@ -1521,7 +1986,7 @@ class SensorReader:
                         "accelerometer kernel read is blocked; switch handling remains active",
                     )
                 return None
-            self._worker = None
+            self._read_pending = False
             if generation != self._generation:
                 return None
             if error is not None:
@@ -1536,25 +2001,8 @@ class SensorReader:
                 self._start_read(now)
                 return reading
 
-        if self.device is None:
-            if now < self._next_discovery:
-                return None
-            try:
-                device = discover_accel()
-            except Exception as exc:
-                device = None
-                self.logger.error("sensor-discovery", f"sensor discovery failed: {exc}")
-            if device is None:
-                self._next_discovery = now + DEVICE_RETRY_INTERVAL
-                self.logger.error(
-                    "sensor-missing",
-                    "display accelerometer not found; retrying",
-                )
-                return None
-            self.device = device
-            self.logger.info(
-                f"accelerometer {device.iio_path} selected (hub {device.hid_hub})"
-            )
+        if self.device is None and not self._select_device(now):
+            return None
         self._start_read(now)
         return None
 
@@ -1562,13 +2010,44 @@ class SensorReader:
 class RotationDaemon:
     """Coordinate switch state, filtered samples, and safe display/shell updates."""
 
-    def __init__(self, logger: Logger, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        logger: Logger,
+        dry_run: bool = False,
+        runtime: Optional[RuntimeConfig] = None,
+        hyprland: Optional[Any] = None,
+        *,
+        switch: Optional[Any] = None,
+        sensor: Optional[Any] = None,
+        hyprland_events: Any = _DEFAULT_COMPONENT,
+        clock: Callable[[], float] = time.monotonic,
+        poll_factory: Callable[[], Any] = select.poll,
+    ) -> None:
         self.logger = logger
         self.dry_run = dry_run
+        self.runtime = runtime or _runtime_from_globals()
         self.stop = threading.Event()
-        self.switch = SwitchReader(logger)
-        self.sensor = SensorReader(logger)
-        self.filter = OrientationFilter()
+        pipe_flags = os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        self._wake_read_fd, self._wake_write_fd = os.pipe2(pipe_flags)
+        self._wake_closed = False
+        self.clock = clock
+        self.poll_factory = poll_factory
+        self.switch = (
+            switch if switch is not None else SwitchReader(logger, self.runtime)
+        )
+        self.sensor = (
+            sensor if sensor is not None else SensorReader(logger, self.runtime)
+        )
+        self.filter = OrientationFilter(self.runtime)
+        self.hyprland = (
+            hyprland
+            if hyprland is not None
+            else SubprocessHyprlandClient(logger, self.runtime)
+        )
+        if hyprland_events is _DEFAULT_COMPONENT:
+            self.hyprland_events = None if dry_run else HyprlandEventReader(logger)
+        else:
+            self.hyprland_events = hyprland_events
         self.tablet_mode: Optional[bool] = None
         self.desired_transform: Optional[int] = None
         self.last_applied_transform: Optional[int] = None
@@ -1577,13 +2056,138 @@ class RotationDaemon:
         self.next_monitor_check = 0.0
         self.next_apply_retry = 0.0
         self.apply_retry_delay = INITIAL_APPLY_RETRY
+        self._desired_generation = 0
+        self._layer_remap: Optional[LayerRemapOperation] = None
 
     def request_stop(self) -> None:
         self.stop.set()
+        if self._wake_closed:
+            return
+        try:
+            os.write(self._wake_write_fd, b"\0")
+        except BlockingIOError:
+            pass
+        except OSError:
+            if not self._wake_closed:
+                raise
+
+    def _close_wake_pipe(self) -> None:
+        if self._wake_closed:
+            return
+        self._wake_closed = True
+        for fd in (self._wake_read_fd, self._wake_write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _drain_wake_pipe(self) -> None:
+        while True:
+            try:
+                if not os.read(self._wake_read_fd, 4096):
+                    return
+            except BlockingIOError:
+                return
+            except InterruptedError:
+                continue
+
+    def _next_deadline(self) -> float:
+        deadlines = [self.switch.next_deadline()]
+        if self.hyprland_events is not None:
+            deadlines.append(self.hyprland_events.next_deadline())
+        if self.tablet_mode is True:
+            deadlines.append(self.next_sensor_sample)
+        if self.desired_transform is not None:
+            if math.isfinite(self.next_apply_retry):
+                deadlines.append(self.next_apply_retry)
+            if not self.dry_run:
+                deadlines.append(self.next_monitor_check)
+        if self._layer_remap is not None:
+            deadlines.append(self._layer_remap.deadline)
+        return min(deadlines)
+
+    def _wait_for_work(self) -> None:
+        if self.stop.is_set():
+            return
+        poller = self.poll_factory()
+        poller.register(self._wake_read_fd, select.POLLIN)
+        switch_fd = self.switch.fd
+        if switch_fd is not None:
+            poller.register(
+                switch_fd,
+                select.POLLIN | select.POLLERR | select.POLLHUP | select.POLLNVAL,
+            )
+        event_fd = (
+            self.hyprland_events.fd
+            if self.hyprland_events is not None
+            else None
+        )
+        if event_fd is not None:
+            poller.register(
+                event_fd,
+                select.POLLIN | select.POLLERR | select.POLLHUP | select.POLLNVAL,
+            )
+        delay = max(0.0, self._next_deadline() - self.clock())
+        timeout_ms = max(1, math.ceil(delay * 1000.0))
+        try:
+            events = poller.poll(timeout_ms)
+        except InterruptedError:
+            return
+        if any(fd == self._wake_read_fd for fd, _event in events):
+            self._drain_wake_pipe()
 
     def _schedule_apply_retry(self, now: float) -> None:
         self.next_apply_retry = now + self.apply_retry_delay
         self.apply_retry_delay = min(self.apply_retry_delay * 2.0, MAX_APPLY_RETRY)
+
+    def _finish_layer_remap(self, success: bool) -> None:
+        self._layer_remap = None
+        if success:
+            return
+        self.logger.error(
+            "layer-remap-fallback",
+            "fast layer remap failed; falling back to Omarchy shell restart",
+        )
+        self.hyprland.restart_shell()
+
+    def _start_layer_remap(
+        self, transform: int, status: MonitorStatus, now: float
+    ) -> None:
+        self._cancel_layer_remap()
+        operation = LayerRemapOperation(
+            transform,
+            self._desired_generation,
+            status,
+            self.hyprland,
+            self.logger,
+            self.runtime,
+        )
+        result = operation.start(now)
+        if result is None:
+            self._layer_remap = operation
+        else:
+            self._finish_layer_remap(result)
+
+    def _advance_layer_remap(self, now: float) -> None:
+        operation = self._layer_remap
+        if operation is None:
+            return
+        if operation.generation != self._desired_generation:
+            self._cancel_layer_remap()
+            return
+        result = operation.advance(now)
+        if result is not None:
+            self._finish_layer_remap(result)
+
+    def _cancel_layer_remap(self) -> None:
+        operation, self._layer_remap = self._layer_remap, None
+        if operation is None:
+            return
+        if not operation.cancel():
+            self.logger.error(
+                "layer-remap-cancel",
+                f"monitor {self.runtime.output} position could not be restored while cancelling remap",
+            )
 
     def _apply_if_needed(
         self,
@@ -1613,14 +2217,14 @@ class RotationDaemon:
             return
 
         if status is None:
-            status = query_monitor_status(self.logger)
+            status = self.hyprland.query_monitor()
         if status is None or not status.found:
             self._schedule_apply_retry(now)
             return
         if not status.enabled:
             self.logger.error(
                 "monitor-disabled",
-                f"monitor {OUTPUT_NAME} is disabled; waiting before applying transform",
+                f"monitor {self.runtime.output} is disabled; waiting before applying transform",
             )
             self._schedule_apply_retry(now)
             return
@@ -1634,19 +2238,19 @@ class RotationDaemon:
             return
 
         previous_status = status
-        if apply_eval(transform, self.logger):
+        self._cancel_layer_remap()
+        confirmed_status = self.hyprland.apply_transform(transform)
+        if confirmed_status is not None:
             # Record the transform before the geometry refresh so a fallback
             # failure cannot cause the monitor update to be retried.
             self.last_applied_transform = transform
             self.next_apply_retry = math.inf
             self.apply_retry_delay = INITIAL_APPLY_RETRY
-            if should_refresh_geometry(previous_status, transform) and DESKTOP_INTEGRATION == "omarchy":
-                if not fast_layer_remap(transform, self.logger):
-                    self.logger.error(
-                        "layer-remap-fallback",
-                        "fast layer remap failed; falling back to Omarchy shell restart",
-                    )
-                    restart_omarchy_shell(self.logger)
+            if (
+                should_refresh_geometry(previous_status, transform)
+                and self.runtime.desktop_integration == "omarchy"
+            ):
+                self._start_layer_remap(transform, confirmed_status, now)
             self.logger.info(f"transform -> {transform}")
         else:
             self._schedule_apply_retry(now)
@@ -1659,6 +2263,8 @@ class RotationDaemon:
         ):
             self.logger.error("transform", f"ignoring invalid requested transform {transform}")
             return
+        self._desired_generation += 1
+        self._cancel_layer_remap()
         self.desired_transform = transform
         self.next_apply_retry = now
         self.apply_retry_delay = INITIAL_APPLY_RETRY
@@ -1670,6 +2276,8 @@ class RotationDaemon:
             if self.tablet_mode is not None:
                 self.logger.error("switch-state", "tablet mode state unavailable; waiting for switch")
                 self.tablet_mode = None
+                self._desired_generation += 1
+                self._cancel_layer_remap()
                 self.desired_transform = None
                 self.filter.reset()
                 self.sensor.reset()
@@ -1686,6 +2294,8 @@ class RotationDaemon:
         if state:
             # Do not change an existing transform until a tablet orientation has
             # passed the filter.  This is also the safe startup behavior.
+            self._desired_generation += 1
+            self._cancel_layer_remap()
             self.desired_transform = None
             self.logger.info("tablet mode on; waiting for stable orientation")
         else:
@@ -1696,14 +2306,16 @@ class RotationDaemon:
         reading = self.sensor.read(now)
         if reading is None:
             return
-        transform = self.filter.update(map_sensor_values(reading.values), now)
+        transform = self.filter.update(
+            map_sensor_values(reading.values, self.runtime), now
+        )
         if transform is not None:
             self._set_desired(transform, now, "stable orientation")
 
     def _reconcile_monitor(self, now: float) -> None:
         if self.dry_run or self.desired_transform is None:
             return
-        status = query_monitor_status(self.logger)
+        status = self.hyprland.query_monitor()
         if status is None:
             self._schedule_apply_retry(now)
             return
@@ -1716,32 +2328,49 @@ class RotationDaemon:
         ):
             self._apply_if_needed(now, "monitor check", status)
 
+    def _monitor_check_interval(self) -> float:
+        if self.hyprland_events is not None and self.hyprland_events.connected:
+            return EVENT_MONITOR_CHECK_INTERVAL
+        return MONITOR_CHECK_INTERVAL
+
+    def _process_once(self, now: float) -> None:
+        self.switch.poll(now)
+        self._handle_switch_state(now)
+        if self.hyprland_events is not None and self.hyprland_events.poll(now):
+            # A config reload may preserve the monitor transform while losing
+            # the touch mapping.  Forget the prior paired apply so the fresh
+            # reconciliation re-establishes both in one guarded mutation.
+            self.last_applied_transform = None
+            self.next_monitor_check = now
+        self._advance_layer_remap(now)
+        if self.tablet_mode is True and now >= self.next_sensor_sample:
+            self._sample_sensor(now)
+            self.next_sensor_sample = now + LOOP_INTERVAL
+        if self.desired_transform is not None and now >= self.next_apply_retry:
+            self._apply_if_needed(now, "retry")
+        if now >= self.next_monitor_check:
+            self._reconcile_monitor(now)
+            self.next_monitor_check = now + self._monitor_check_interval()
+
     def run(self) -> int:
         self.logger.info("started" + (" (dry-run)" if self.dry_run else ""))
         try:
             while not self.stop.is_set():
-                now = time.monotonic()
+                now = self.clock()
                 try:
-                    self.switch.poll(now)
-                    self._handle_switch_state(now)
-                    if self.tablet_mode is True and now >= self.next_sensor_sample:
-                        self._sample_sensor(now)
-                        self.next_sensor_sample = now + LOOP_INTERVAL
-                    if (
-                        self.desired_transform is not None
-                        and now >= self.next_apply_retry
-                    ):
-                        self._apply_if_needed(now, "retry")
-                    if now >= self.next_monitor_check:
-                        self._reconcile_monitor(now)
-                        self.next_monitor_check = now + MONITOR_CHECK_INTERVAL
+                    self._process_once(now)
                 except Exception as exc:  # Keep transient sysfs/IPC failures nonfatal.
                     self.logger.error("loop", f"temporary loop failure: {exc}")
-                self.stop.wait(LOOP_INTERVAL)
+                self._wait_for_work()
         except KeyboardInterrupt:
-            self.stop.set()
+            self.request_stop()
         finally:
+            self._cancel_layer_remap()
             self.switch.close()
+            self.sensor.close()
+            if self.hyprland_events is not None:
+                self.hyprland_events.close()
+            self._close_wake_pipe()
         self.logger.info("stopped")
         return 0
 
@@ -1754,7 +2383,7 @@ def _runtime_lock_path() -> str:
 
 
 def apply_config(config: HardwareConfig) -> None:
-    """Apply validated machine-specific values before device discovery starts."""
+    """Update legacy facade defaults; the live daemon uses ``RuntimeConfig``."""
 
     global OUTPUT_NAME, TOUCH_DEVICE_NAME, SWITCH_NAME, PREFERRED_SWITCH_PATH
     global DESKTOP_INTEGRATION, AXIS_ORDER, AXIS_SIGNS, ORIENTATION_TRANSFORMS
@@ -1806,15 +2435,6 @@ def acquire_lock(logger: Logger) -> Optional[int]:
 
 def _format_values(values: Iterable[Any]) -> str:
     return " ".join(str(value) for value in values)
-
-
-def application_version() -> str:
-    """Return the installed release, or an explicit source-tree fallback."""
-
-    try:
-        return version("tablet-auto-rotate")
-    except PackageNotFoundError:
-        return SOURCE_VERSION
 
 
 def _configuration_report(
@@ -1869,10 +2489,11 @@ def collect_probe_report(
     """Collect a sanitized, versioned hardware report without writing stdout."""
 
     logger = Logger(verbose)
+    runtime = RuntimeConfig.from_hardware(config)
     report = _report_envelope("probe", config, config_path)
     errors: list[dict[str, str]] = []
     try:
-        selection, switch_devices = discover_switch_selection()
+        selection, switch_devices = discover_switch_selection(runtime)
         candidates = (
             [switch_devices[selection.selected.path]]
             if selection.selected is not None
@@ -1938,7 +2559,7 @@ def collect_probe_report(
 
     sensor_ok = False
     try:
-        sensor = discover_accel()
+        sensor = discover_accel(runtime)
     except Exception as exc:
         sensor = None
         errors.append({"component": "sensor_discovery", "message": _sanitize_error(exc)})
@@ -1965,7 +2586,7 @@ def collect_probe_report(
             "scale_paths": [sanitize_report_path(path) for path in sensor.scale_paths],
         }
         try:
-            reading = read_accel(sensor)
+            reading = read_accel(sensor, runtime)
         except Exception as exc:
             errors.append({"component": "sensor_read", "message": _sanitize_error(exc)})
             logger.error("probe-sensor-read", f"cannot read sensor: {exc}", interval=0.0)
@@ -2061,22 +2682,24 @@ def _assert_self_test(condition: bool, message: str) -> None:
 
 
 def run_self_test() -> int:
-    """Exercise pure classification, parsing, commands, verification, and ioctl construction."""
+    """Run a small installed smoke test; detailed cases live in pytest."""
 
     try:
         _assert_self_test(INPUT_EVENT_SIZE == 24, "64-bit input_event size is not 24")
-        packed = struct.pack(INPUT_EVENT_FORMAT, 1, 2, EV_SW, SW_TABLET_MODE, 1)
-        unpacked = INPUT_EVENT.unpack(packed)
-        _assert_self_test(unpacked[2:] == (EV_SW, SW_TABLET_MODE, 1), "input_event unpack")
-
+        packed = INPUT_EVENT.pack(1, 2, EV_SW, SW_TABLET_MODE, 1)
+        _assert_self_test(
+            INPUT_EVENT.unpack(packed)[2:] == (EV_SW, SW_TABLET_MODE, 1),
+            "input_event unpack",
+        )
         expected_ioctl = (
             (IOC_READ << IOC_DIRSHIFT)
             | (SW_MASK_BYTES << IOC_SIZESHIFT)
             | (ord("E") << IOC_TYPESHIFT)
             | 0x1B
         )
-        _assert_self_test(EVIOCGSW_REQUEST == expected_ioctl, "EVIOCGSW request construction")
-        _assert_self_test(evio_cgsw(1) != evio_cgsw(2), "EVIOCGSW size encoding")
+        _assert_self_test(
+            EVIOCGSW_REQUEST == expected_ioctl, "EVIOCGSW request construction"
+        )
 
         for values, expected in (
             ((0.0, GRAVITY, 0.0), 2),
@@ -2084,370 +2707,55 @@ def run_self_test() -> int:
             ((0.0, -GRAVITY, 0.0), 0),
             ((-GRAVITY, 0.0, 0.0), 3),
         ):
-            _assert_self_test(classify_orientation(values) == expected, f"orientation {values}")
-        for values in (
-            (0.0, 0.0, GRAVITY),       # flat/normal to the screen
-            (GRAVITY, GRAVITY, 0.0),   # diagonal
-            (0.0, 2.0, 0.0),           # movement/no gravity
-            (float("nan"), 0.0, 0.0),
-            (0.0, 0.0, 20.0),
-        ):
-            _assert_self_test(classify_orientation(values) is None, f"rejected vector {values}")
+            _assert_self_test(
+                classify_orientation(values) == expected,
+                f"orientation {values}",
+            )
+        _assert_self_test(
+            classify_orientation((0.0, 0.0, GRAVITY)) is None,
+            "flat vector rejection",
+        )
 
         orientation_filter = OrientationFilter()
-        _assert_self_test(orientation_filter.update((0.0, GRAVITY, 0.0), 0.0) is None,
-                          "candidate accepted too early")
-        _assert_self_test(orientation_filter.update((0.0, GRAVITY, 0.0), 0.10) is None,
-                          "candidate accepted too early 2")
-        _assert_self_test(orientation_filter.update((0.0, GRAVITY, 0.0), 0.20) is None,
-                          "candidate accepted too early 3")
-        _assert_self_test(orientation_filter.update((0.0, GRAVITY, 0.0), 0.36) == 2,
-                          "candidate hold")
-        _assert_self_test(orientation_filter.update((0.0, 0.0, GRAVITY), 0.46) is None,
-                          "flat sample not rejected")
+        upright = (0.0, GRAVITY, 0.0)
+        for now in (0.0, 0.10, 0.20):
+            _assert_self_test(
+                orientation_filter.update(upright, now) is None,
+                "candidate accepted too early",
+            )
+        _assert_self_test(
+            orientation_filter.update(upright, 0.36) == 2,
+            "candidate hold",
+        )
 
         _assert_self_test(
             build_eval_command(2)
             == 'hl.monitor({ output = "eDP-1", transform = 2 }); '
-               'hl.device({ name = "elan9004:00-04f3:4110", output = "eDP-1", transform = 2 }); '
-               'hl.dispatch(hl.dsp.force_renderer_reload())',
+            'hl.device({ name = "elan9004:00-04f3:4110", output = "eDP-1", '
+            'transform = 2 }); hl.dispatch(hl.dsp.force_renderer_reload())',
             "Hyprland command construction",
         )
-        try:
-            build_eval_command(4)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("transform allowlist")
-
         _assert_self_test(
             build_position_eval_command(-1920, 37)
             == 'hl.monitor({ output = "eDP-1", position = "-1920x37" }); '
-               'hl.dispatch(hl.dsp.force_renderer_reload())',
+            'hl.dispatch(hl.dsp.force_renderer_reload())',
             "monitor position command construction",
         )
-        for invalid_position in ((True, 0), (0, False), (1.5, 0), (0, "1")):
-            try:
-                build_position_eval_command(*invalid_position)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f"position validation: {invalid_position}")
-
-        touch_payload = {
-            "touch": [
-                {"name": TOUCH_DEVICE_NAME},
-                {"name": "unrelated-touch-device"},
-            ]
-        }
         _assert_self_test(
-            parse_touch_device_names(touch_payload)
-            == {TOUCH_DEVICE_NAME, "unrelated-touch-device"},
+            has_touch_device({"touch": [{"name": TOUCH_DEVICE_NAME}]}),
             "touch device parsing",
         )
-        _assert_self_test(has_touch_device(touch_payload), "touch device presence")
         _assert_self_test(
-            has_touch_device({"devices": touch_payload}),
-            "wrapped touch device parsing",
-        )
-        _assert_self_test(
-            not has_touch_device({"touch": [{"name": TOUCH_DEVICE_NAME + "-other"}]}),
-            "exact touch device name matching",
-        )
-        _assert_self_test(
-            not has_touch_device({"devices": [{"name": TOUCH_DEVICE_NAME}]}),
-            "touch list is required",
-        )
-
-        status = parse_monitor_status(
-            [{"name": OUTPUT_NAME, "disabled": False, "transform": 3}]
-        )
-        _assert_self_test(
-            status == MonitorStatus(True, True, 3, active_monitor_count=1),
+            parse_monitor_status(
+                [{"name": OUTPUT_NAME, "disabled": False, "transform": 3}]
+            )
+            == MonitorStatus(True, True, 3, active_monitor_count=1),
             "monitor parsing",
         )
-        geometry_status = parse_monitor_status(
-            {
-                "monitors": [
-                    {
-                        "name": OUTPUT_NAME,
-                        "disabled": False,
-                        "transform": 1,
-                        "x": -1920,
-                        "y": 37,
-                        "width": 2880,
-                        "height": 1800,
-                    }
-                ]
-            }
-        )
         _assert_self_test(
-            geometry_status
-            == MonitorStatus(
-                True,
-                True,
-                1,
-                -1920,
-                37,
-                2880,
-                1800,
-                active_monitor_count=1,
-            ),
-            "monitor geometry parsing",
-        )
-        malformed_geometry = parse_monitor_status(
-            [
-                {
-                    "name": OUTPUT_NAME,
-                    "transform": 1,
-                    "x": True,
-                    "y": 1.5,
-                    "width": "2880",
-                    "height": None,
-                }
-            ]
-        )
-        _assert_self_test(
-            malformed_geometry
-            == MonitorStatus(True, True, 1, active_monitor_count=1),
-            "invalid monitor geometry parsing",
-        )
-        disabled = parse_monitor_status(
-            {"monitors": [{"name": OUTPUT_NAME, "disabled": True, "transform": 0}]}
-        )
-        _assert_self_test(not disabled.enabled, "disabled monitor parsing")
-        _assert_self_test(
-            disabled.active_monitor_count == 0,
-            "disabled monitor excluded from active count",
-        )
-        monitor_count_status = parse_monitor_status(
-            [
-                {"name": OUTPUT_NAME, "disabled": False, "transform": 2},
-                {"name": "HDMI-A-1", "disabled": False, "transform": 0},
-                {"name": "DP-1", "disabled": True, "transform": 1},
-            ]
-        )
-        _assert_self_test(
-            monitor_count_status.active_monitor_count == 2,
-            "active monitor count parsing",
-        )
-        _assert_self_test(
-            monitor_status_matches(MonitorStatus(True, True, 2), 2),
-            "monitor verification match",
-        )
-        _assert_self_test(
-            should_refresh_geometry(MonitorStatus(True, True, 0), 2),
-            "geometry refresh on transform change",
-        )
-        _assert_self_test(
-            should_refresh_geometry(MonitorStatus(True, True, 2), 0),
-            "geometry refresh on 180-degree transform change",
-        )
-        for unchanged_status in (
-            None,
-            MonitorStatus(True, True, 2),
-            MonitorStatus(True, True, None),
-            MonitorStatus(True, True, True),
-        ):
-            _assert_self_test(
-                not should_refresh_geometry(unchanged_status, 2),
-                "no geometry refresh without a prior differing integer transform",
+            find_hid_hub_ancestor(
+                "/sys/x/001F:8087:0AC2.0003/HID-SENSOR/iio:device0"
             )
-        for invalid_status in (
-            None,
-            MonitorStatus(False, True, 2),
-            MonitorStatus(True, False, 2),
-            MonitorStatus(True, True, 1),
-        ):
-            _assert_self_test(
-                not monitor_status_matches(invalid_status, 2),
-                "monitor verification rejection",
-            )
-        verification_statuses = iter(
-            (
-                MonitorStatus(True, True, 1),
-                MonitorStatus(True, False, 2),
-                MonitorStatus(True, True, 2),
-            )
-        )
-        verification_sleeps: list[float] = []
-        _assert_self_test(
-            verify_monitor_transform(
-                2,
-                Logger(),
-                query=lambda: next(verification_statuses),
-                sleep=verification_sleeps.append,
-            ),
-            "monitor verification polling",
-        )
-        _assert_self_test(
-            verification_sleeps
-            == [POST_APPLY_VERIFY_DELAY, POST_APPLY_VERIFY_DELAY],
-            "monitor verification delay",
-        )
-
-        class SelfTestLogger:
-            def error(self, *_args: Any, **_kwargs: Any) -> None:
-                pass
-
-            def debug(self, *_args: Any, **_kwargs: Any) -> None:
-                pass
-
-        original_x, original_y = 17, -4
-        happy_statuses = [
-            MonitorStatus(
-                True,
-                True,
-                2,
-                original_x,
-                original_y,
-                active_monitor_count=1,
-            ),
-            MonitorStatus(
-                True,
-                True,
-                2,
-                original_x,
-                original_y + 1,
-                active_monitor_count=1,
-            ),
-            MonitorStatus(
-                True,
-                True,
-                2,
-                original_x,
-                original_y,
-                active_monitor_count=1,
-            ),
-        ]
-        happy_events: list[tuple[Any, ...]] = []
-
-        def happy_query() -> Optional[MonitorStatus]:
-            happy_events.append(("query",))
-            if not happy_statuses:
-                raise AssertionError("fast remap queried too many times")
-            return happy_statuses.pop(0)
-
-        def happy_set_position(x: int, y: int) -> bool:
-            happy_events.append(("set", x, y))
-            return True
-
-        def happy_sleep(delay: float) -> None:
-            happy_events.append(("sleep", delay))
-
-        _assert_self_test(
-            fast_layer_remap(
-                2,
-                SelfTestLogger(),
-                query=happy_query,
-                set_position=happy_set_position,
-                sleep=happy_sleep,
-            ),
-            "fast layer remap happy path",
-        )
-        _assert_self_test(
-            happy_events
-            == [
-                ("query",),
-                ("set", original_x, original_y + 1),
-                ("sleep", LAYER_REMAP_NUDGE_DELAY),
-                ("query",),
-                ("set", original_x, original_y),
-                ("sleep", LAYER_REMAP_SETTLE_DELAY),
-                ("query",),
-            ],
-            "fast layer remap call/query/sleep order",
-        )
-
-        no_op_statuses = [
-            MonitorStatus(
-                True,
-                True,
-                2,
-                original_x,
-                original_y,
-                active_monitor_count=1,
-            ),
-            MonitorStatus(
-                True,
-                True,
-                2,
-                original_x,
-                original_y,
-                active_monitor_count=1,
-            ),
-        ]
-        no_op_events: list[tuple[Any, ...]] = []
-
-        def no_op_query() -> Optional[MonitorStatus]:
-            no_op_events.append(("query",))
-            if not no_op_statuses:
-                raise AssertionError("no-op remap queried too many times")
-            return no_op_statuses.pop(0)
-
-        def no_op_set_position(x: int, y: int) -> bool:
-            no_op_events.append(("set", x, y))
-            return True
-
-        def no_op_sleep(delay: float) -> None:
-            no_op_events.append(("sleep", delay))
-
-        _assert_self_test(
-            not fast_layer_remap(
-                2,
-                SelfTestLogger(),
-                query=no_op_query,
-                set_position=no_op_set_position,
-                sleep=no_op_sleep,
-            ),
-            "silent no-op midpoint failure",
-        )
-        _assert_self_test(
-            no_op_events
-            == [
-                ("query",),
-                ("set", original_x, original_y + 1),
-                ("sleep", LAYER_REMAP_NUDGE_DELAY),
-                ("query",),
-                ("set", original_x, original_y),
-            ],
-            "silent no-op midpoint restore",
-        )
-
-        multi_monitor_positions: list[tuple[int, int]] = []
-        multi_monitor_sleeps: list[float] = []
-
-        def multi_monitor_set_position(x: int, y: int) -> bool:
-            multi_monitor_positions.append((x, y))
-            return True
-
-        def multi_monitor_sleep(delay: float) -> None:
-            multi_monitor_sleeps.append(delay)
-
-        _assert_self_test(
-            not fast_layer_remap(
-                2,
-                SelfTestLogger(),
-                query=lambda: MonitorStatus(
-                    True,
-                    True,
-                    2,
-                    original_x,
-                    original_y,
-                    active_monitor_count=2,
-                ),
-                set_position=multi_monitor_set_position,
-                sleep=multi_monitor_sleep,
-            ),
-            "multi-monitor initial rejection",
-        )
-        _assert_self_test(
-            not multi_monitor_positions and not multi_monitor_sleeps,
-            "multi-monitor rejection mutated position",
-        )
-
-        _assert_self_test(
-            find_hid_hub_ancestor("/sys/x/001F:8087:0AC2.0003/HID-SENSOR/iio:device0")
             == "001F:8087:0AC2.0003",
             "HID hub ancestry",
         )
@@ -2464,6 +2772,7 @@ def collect_doctor_report(
 ) -> dict[str, Any]:
     """Collect read-only compatibility checks in a stable report schema."""
 
+    runtime = RuntimeConfig.from_hardware(config)
     checks: list[tuple[str, str, bool, str]] = []
     checks.append((
         "input_abi",
@@ -2499,7 +2808,7 @@ def collect_doctor_report(
     checks.append(("tablet_switch", "tablet switch", bool(config.switch_name), sanitize_report_name(config.switch_name)))
 
     try:
-        selection, _ = discover_switch_selection()
+        selection, _ = discover_switch_selection(runtime)
     except Exception as exc:
         checks.append(("switch_discovery", "switch discovery", False, f"failed: {_sanitize_error(exc)}"))
     else:
@@ -2510,7 +2819,7 @@ def collect_doctor_report(
             sanitize_report_name(f"{selection.status}: {selection.summary}"),
         ))
     try:
-        sensor = discover_accel()
+        sensor = discover_accel(runtime)
     except Exception as exc:
         checks.append(("accelerometer_discovery", "accelerometer discovery", False, f"failed: {_sanitize_error(exc)}"))
     else:
@@ -2523,7 +2832,9 @@ def collect_doctor_report(
 
     if hyprctl_found:
         logger = Logger(False)
-        monitor = query_monitor_status(logger, report_errors=False)
+        monitor = query_monitor_status(
+            logger, report_errors=False, runtime=runtime
+        )
         checks.append((
             "hyprland_output",
             "Hyprland output",
@@ -2534,7 +2845,7 @@ def collect_doctor_report(
                 else f"{config.output} is not available and enabled"
             ),
         ))
-        touch = query_touch_device(logger)
+        touch = query_touch_device(logger, runtime)
         checks.append((
             "hyprland_touch_device",
             "Hyprland touch device",
@@ -2641,7 +2952,8 @@ def run_interactive_calibration(config: HardwareConfig) -> int:
             file=sys.stderr,
         )
         return 2
-    sensor = discover_accel()
+    runtime = RuntimeConfig.from_hardware(config)
+    sensor = discover_accel(runtime)
     if sensor is None:
         print(f"{SCRIPT_NAME}: display accelerometer not found", file=sys.stderr)
         return 1
@@ -2658,7 +2970,7 @@ def run_interactive_calibration(config: HardwareConfig) -> int:
             input(f"{instruction}; press Enter when stable: ")
             readings: list[Tuple[float, float, float]] = []
             for _ in range(10):
-                readings.append(read_accel(sensor).values)
+                readings.append(read_accel(sensor, runtime).values)
                 time.sleep(LOOP_INTERVAL)
             samples[label] = readings
         result = infer_axis_mapping(samples)
@@ -2674,53 +2986,23 @@ def run_interactive_calibration(config: HardwareConfig) -> int:
     return 0
 
 
-def _install_signal_handlers(stop: threading.Event) -> None:
+def _install_signal_handlers(request_stop: Callable[[], None]) -> None:
     def handle_signal(_signum: int, _frame: Any) -> None:
-        stop.set()
+        request_stop()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version=f"%(prog)s {application_version()}")
-    modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--probe", action="store_true", help="print devices and current read-only state")
-    modes.add_argument("--dry-run", action="store_true", help="run classification without hyprctl changes")
-    modes.add_argument("--self-test", action="store_true", help="run pure logic/ioctl-construction tests")
-    modes.add_argument("--doctor", action="store_true", help="run read-only compatibility checks")
-    modes.add_argument("--install-service", action="store_true", help="install the systemd user unit")
-    modes.add_argument("--uninstall-service", action="store_true", help="remove an unmodified generated user unit")
-    modes.add_argument(
-        "--calibrate-from",
-        metavar="SAMPLES.json",
-        help="infer sensor mapping from reviewed labeled samples and print TOML",
-    )
-    modes.add_argument("--calibrate", action="store_true", help="interactively infer sensor axes without rotating")
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        help="load machine settings from a TOML file",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="emit a versioned JSON report with --probe or --doctor",
-    )
-    parser.add_argument("--verbose", action="store_true", help="log diagnostic details")
-    parser.add_argument("--service-dry-run", action="store_true", help="preview a service operation")
-    parser.add_argument("--replace-service", action="store_true", help="back up and replace a differing user unit")
-    parser.add_argument("--service-executable", metavar="PATH", help="absolute executable path for the user unit")
-    args = parser.parse_args(argv)
-    if args.json_output and not (args.probe or args.doctor):
-        parser.error("--json requires --probe or --doctor")
-    return args
+    from .cli import parse_args as cli_parse_args
+
+    return cli_parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+def run_args(args: argparse.Namespace) -> int:
+    """Dispatch already-parsed CLI arguments."""
+
     if args.self_test:
         return run_self_test()
     if args.install_service or args.uninstall_service:
@@ -2733,7 +3015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"{SCRIPT_NAME}: invalid configuration: {exc}", file=sys.stderr)
         return 2
-    apply_config(config)
+    runtime = RuntimeConfig.from_hardware(config)
     if args.calibrate_from:
         return run_calibration_file(Path(args.calibrate_from), config)
     if args.calibrate:
@@ -2761,8 +3043,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if lock_fd is None:
         return 1
 
-    daemon = RotationDaemon(logger, dry_run=args.dry_run)
-    _install_signal_handlers(daemon.stop)
+    daemon = RotationDaemon(logger, dry_run=args.dry_run, runtime=runtime)
+    _install_signal_handlers(daemon.request_stop)
     try:
         return daemon.run()
     finally:
@@ -2770,6 +3052,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             os.close(lock_fd)
         except OSError:
             pass
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    return run_args(parse_args(argv))
 
 
 if __name__ == "__main__":
