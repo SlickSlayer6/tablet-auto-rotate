@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+- Replace the daemon's fixed 10 Hz wakeup loop with deadline-driven polling
+  over tablet-switch, Hyprland-event, and stop-wakeup descriptors plus sensor
+  and recovery deadlines.
+- Keep one bounded accelerometer worker alive, reuse its sysfs descriptors and
+  scale metadata, and invalidate the session safely after read failures.
+- Retry an explicitly configured tablet switch directly after disconnects
+  while retaining conservative full discovery for automatic selection, and
+  bound repeated missing-device scans with exponential backoff.
+- Make runtime configuration instance-local so multiple daemon objects cannot
+  overwrite one another through module globals.
+- Reconcile monitor changes from Hyprland events with periodic polling as a
+  fallback, and make the post-transform layer remap non-blocking and
+  generation-safe.
+- Centralize bounded subprocess execution, reuse the confirmed monitor status
+  after a transform, and keep the touch-device safety check immediately before
+  each display mutation.
+- Move orientation filtering, CLI parsing, and version lookup into focused
+  modules so lightweight commands do not import the daemon core.
+
 ## 0.4.1
 
 - Add a bounded AI-assisted setup prompt covering safe installation, discovery,

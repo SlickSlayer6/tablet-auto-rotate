@@ -26,15 +26,15 @@ def _successful_probe(monkeypatch):
         raw_paths=("/sys/raw_x", "/sys/raw_y", "/sys/raw_z"),
         scale_paths=("/sys/scale", "/sys/scale", "/sys/scale"),
     )
-    monkeypatch.setattr(core, "discover_switch_selection", lambda: (selection, {candidate.path: device}))
+    monkeypatch.setattr(core, "discover_switch_selection", lambda _runtime=None: (selection, {candidate.path: device}))
     monkeypatch.setattr(core, "open_switch_device", lambda _device: (99, True))
     monkeypatch.setattr(core.os, "close", lambda _fd: None)
     monkeypatch.setattr(core, "_read_text", lambda _path: "Tablet\nSwitch")
-    monkeypatch.setattr(core, "discover_accel", lambda: sensor)
+    monkeypatch.setattr(core, "discover_accel", lambda _runtime=None: sensor)
     monkeypatch.setattr(
         core,
         "read_accel",
-        lambda _sensor: core.AccelReading((1, 2, 3), (0.1, 0.1, 0.1), (0.1, 0.2, 0.3)),
+        lambda _sensor, _runtime=None: core.AccelReading((1, 2, 3), (0.1, 0.1, 0.1), (0.1, 0.2, 0.3)),
     )
 
 
@@ -69,8 +69,8 @@ def test_probe_json_is_versioned_structured_and_sanitized(monkeypatch, capsys):
 
 
 def test_probe_json_failure_remains_valid(monkeypatch, capsys):
-    monkeypatch.setattr(core, "discover_switch_selection", lambda: (_ for _ in ()).throw(OSError("bad\npath")))
-    monkeypatch.setattr(core, "discover_accel", lambda: None)
+    monkeypatch.setattr(core, "discover_switch_selection", lambda _runtime=None: (_ for _ in ()).throw(OSError("bad\npath")))
+    monkeypatch.setattr(core, "discover_accel", lambda _runtime=None: None)
 
     result = core.run_probe(json_output=True)
 
@@ -89,11 +89,11 @@ def test_probe_omits_unrelated_input_names_unless_verbose(monkeypatch):
     unrelated = SwitchCandidate.from_codes("/dev/input/event2", "Private accessory", {0})
     selection = select_tablet_switch([selected, unrelated])
     device = core.SwitchDevice(selected.path, "event1", "/sys/name", selected.name)
-    monkeypatch.setattr(core, "discover_switch_selection", lambda: (selection, {selected.path: device}))
+    monkeypatch.setattr(core, "discover_switch_selection", lambda _runtime=None: (selection, {selected.path: device}))
     monkeypatch.setattr(core, "open_switch_device", lambda _device: (99, False))
     monkeypatch.setattr(core.os, "close", lambda _fd: None)
     monkeypatch.setattr(core, "_read_text", lambda _path: selected.name)
-    monkeypatch.setattr(core, "discover_accel", lambda: None)
+    monkeypatch.setattr(core, "discover_accel", lambda _runtime=None: None)
 
     normal = core.collect_probe_report(HardwareConfig(), None)
     verbose = core.collect_probe_report(HardwareConfig(), None, verbose=True)
@@ -108,8 +108,8 @@ def test_probe_omits_unrelated_input_names_unless_verbose(monkeypatch):
 
 def test_doctor_json_has_stable_check_ids(monkeypatch, capsys):
     monkeypatch.setattr(core.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(core, "discover_switch_selection", lambda: (_ for _ in ()).throw(OSError("missing")))
-    monkeypatch.setattr(core, "discover_accel", lambda: None)
+    monkeypatch.setattr(core, "discover_switch_selection", lambda _runtime=None: (_ for _ in ()).throw(OSError("missing")))
+    monkeypatch.setattr(core, "discover_accel", lambda _runtime=None: None)
 
     result = core.run_doctor(HardwareConfig(), None, json_output=True)
 

@@ -1,12 +1,17 @@
 """Automatic tablet-mode rotation for Linux convertible computers."""
 
-from .core import main
+from __future__ import annotations
 
-try:
-    from importlib.metadata import PackageNotFoundError, version
+from typing import Optional, Sequence
 
-    __version__ = version("tablet-auto-rotate")
-except PackageNotFoundError:
-    __version__ = "0.4.1+source"
+from ._version import __version__
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Load the command implementation only when the entry point is invoked."""
+
+    from .cli import main as cli_main
+
+    return cli_main(argv)
 
 __all__ = ["__version__", "main"]
